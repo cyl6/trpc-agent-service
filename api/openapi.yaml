@@ -1,0 +1,92 @@
+openapi: 3.0.3
+info:
+  title: TRPC Agent Service API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        "200": {description: Alive}
+  /readyz:
+    get:
+      summary: Readiness probe
+      responses:
+        "200": {description: Ready}
+  /webhooks/{channel}/{binding}:
+    post:
+      summary: Signed Telegram or Slack webhook
+      parameters:
+        - {name: channel, in: path, required: true, schema: {type: string, enum: [telegram, slack]}}
+        - {name: binding, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        "202": {description: Verified and queued}
+        "401": {description: Signature rejected}
+        "503": {description: Queue unavailable; provider should retry}
+  /v1/chat/{tenant}:
+    post:
+      summary: Admin-only synchronous smoke-test chat
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: tenant, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, text]
+              properties:
+                message_id: {type: string}
+                user_id: {type: string}
+                conversation_id: {type: string}
+                thread_id: {type: string}
+                scope: {type: string, enum: [direct, group], default: direct}
+                text: {type: string}
+      responses:
+        "200":
+          description: Agent result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  text: {type: string}
+                  request_id: {type: string}
+                  session_id: {type: string}
+                  duplicate: {type: boolean}
+  /admin/v1/tenants:
+    get:
+      summary: List redacted tenant configuration snapshots
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {description: Tenant list}
+  /admin/v1/reload:
+    post:
+      summary: Atomically reload validated tenant revisions
+      security: [{bearerAuth: []}]
+      responses:
+        "200": {description: Reloaded}
+        "400": {description: Validation failed; last-known-good remains active}
+        "409": {description: Static server, coordination, or telemetry changes require restart}
+  /admin/v1/tenants/{tenant}/rollback:
+    post:
+      summary: Roll back one tenant to its previous in-process revision
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: tenant, in: path, required: true, schema: {type: string}}
+      responses:
+        "200": {description: Rolled back}
+        "409": {description: No previous revision}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

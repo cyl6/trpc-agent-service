@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trpc-agent-service
+  namespace: trpc-agent
+  labels:
+    app.kubernetes.io/name: trpc-agent-service
+    app.kubernetes.io/component: gateway-worker
+spec:
+  # Single replica is intentional. Inbox dispatch, tool approvals, budget
+  # counters and config control are process-local in this runnable demo.
+  # Add a durable queue and shared approval/budget/config stores before
+  # increasing replicas; Session and Memory are already Redis-backed.
+  replicas: 1
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  strategy:
+    # Recreate avoids a brief two-Pod overlap while governance state remains
+    # process-local. Accept the demo downtime until those stores are shared.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trpc-agent-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trpc-agent-service
+        app.kubernetes.io/component: gateway-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: trpc-agent-service
+      automountServiceAccountToken: false
+      # Default Agent run timeout is 90s; leave time for preStop and queue drain.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: service
+          image: trpc-agent-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/trpc-agent-service/service.yaml"]
+          env:
+            - name: GOMEMLIMIT
+              value: 420MiB
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: admin-token
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: redis-url
+            - name: ACME_TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-telegram-bot-token
+            - name: ACME_TELEGRAM_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-telegram-webhook-secret
+            - name: ACME_SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-slack-bot-token
+            - name: ACME_SLACK_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-slack-signing-secret
+            - name: GLOBEX_TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: globex-telegram-bot-token
+            - name: GLOBEX_TELEGRAM_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: globex-telegram-webhook-secret
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/trpc-agent-service
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: trpc-agent-service-config
+            items:
+              - key: service.yaml
+                path: service.yaml
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: trpc-agent-service
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: trpc-agent-service

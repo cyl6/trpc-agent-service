@@ -1,0 +1,117 @@
+server:
+  address: ":8080"
+  queue_size: 512
+  worker_count: 8
+  admin_token_env: ADMIN_TOKEN
+
+# InMemory is the zero-dependency demo coordinator. Set backend=redis and
+# redis_url_env=REDIS_URL when running more than one process/node.
+coordination:
+  backend: inmemory
+  key_prefix: trpc-agent
+  lock_ttl: 2m
+  dedup_ttl: 24h
+
+telemetry:
+  service_name: trpc-agent-service
+  # Uncomment for the Docker Compose OTel Collector.
+  # otlp_endpoint: otel-collector:4318
+  # otlp_protocol: http
+
+tenants:
+  - tenant_id: acme
+    version: "2026-08-20.1"
+    enabled: true
+    app:
+      name: support-assistant
+      agent_name: support-agent
+      description: ACME customer support assistant
+      instruction: Answer concisely. Use only tools supplied by the host and never reveal secrets.
+    model:
+      provider: mock
+      name: deterministic-mock
+      max_tokens: 2048
+      temperature: 0.2
+      streaming: false
+      input_price_per_million: 0
+      output_price_per_million: 0
+    tools:
+      allow: [calculator, current_time, tenant_admin_action, memory_search, memory_load, memory_add, memory_update, memory_delete, memory_clear]
+      deny: []
+      require_confirmation: [tenant_admin_action, memory_update, memory_delete, memory_clear]
+    channels:
+      - type: telegram
+        binding_id: acme-telegram
+        enabled: true
+        token_env: ACME_TELEGRAM_BOT_TOKEN
+        signing_secret_env: ACME_TELEGRAM_WEBHOOK_SECRET
+        max_message_length: 4096
+      - type: slack
+        binding_id: acme-slack
+        enabled: true
+        workspace_id: T_ACME
+        application_id: A_ACME_AGENT
+        token_env: ACME_SLACK_BOT_TOKEN
+        signing_secret_env: ACME_SLACK_SIGNING_SECRET
+        max_message_length: 40000
+    data:
+      session: {type: inmemory, namespace: acme-session}
+      memory: {type: inmemory, namespace: acme-memory}
+      summary: {type: inmemory, namespace: acme-summary}
+      artifact: {type: inmemory, namespace: acme-artifact}
+      knowledge: {type: disabled}
+      audit_log: {type: stdout}
+    audit:
+      enabled: true
+      sink: stdout
+      log_content: false
+      redact_patterns:
+        - '(?i)acme-[a-z0-9-]{12,}'
+    budget:
+      requests_per_minute: 120
+      max_input_chars: 12000
+      monthly_cost_usd: 100
+
+  # This second tenant demonstrates per-tenant physical backend selection.
+  # Its Runtime is created lazily, so REDIS_URL is needed only when it receives
+  # a message. Docker Compose supplies it.
+  - tenant_id: globex
+    version: "2026-08-20.1"
+    enabled: true
+    app:
+      name: operations-assistant
+      agent_name: operations-agent
+      description: Globex operations assistant
+      instruction: Help with operations questions. Administrative actions always require confirmation.
+    model:
+      provider: mock
+      name: deterministic-mock
+      max_tokens: 1024
+      temperature: 0
+      streaming: false
+    tools:
+      allow: [current_time, memory_search, memory_load, memory_add, memory_update, memory_delete, memory_clear]
+      deny: [calculator, tenant_admin_action]
+      require_confirmation: [memory_update, memory_delete, memory_clear]
+    channels:
+      - type: telegram
+        binding_id: globex-telegram
+        enabled: true
+        token_env: GLOBEX_TELEGRAM_BOT_TOKEN
+        signing_secret_env: GLOBEX_TELEGRAM_WEBHOOK_SECRET
+        max_message_length: 4096
+    data:
+      session: {type: redis, dsn_env: REDIS_URL, namespace: globex-session}
+      memory: {type: redis, dsn_env: REDIS_URL, namespace: globex-memory}
+      summary: {type: redis, dsn_env: REDIS_URL, namespace: globex-summary}
+      artifact: {type: inmemory, namespace: globex-artifact}
+      knowledge: {type: disabled}
+      audit_log: {type: stdout}
+    audit:
+      enabled: true
+      sink: stdout
+      log_content: false
+    budget:
+      requests_per_minute: 60
+      max_input_chars: 8000
+      monthly_cost_usd: 50

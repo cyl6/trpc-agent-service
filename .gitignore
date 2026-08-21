@@ -1,0 +1,13 @@
+# build artifacts
+bin/
+coverage.out
+
+# local runtime state (keep directory placeholders)
+data/*
+!data/.gitkeep
+trpcservice/workspace/*
+!trpcservice/workspace/.gitkeep
+
+# local overrides
+*.local.yaml
+.env
