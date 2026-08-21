@@ -52,6 +52,15 @@ tenants:
         token_env: ACME_SLACK_BOT_TOKEN
         signing_secret_env: ACME_SLACK_SIGNING_SECRET
         max_message_length: 40000
+      - type: wecom
+        binding_id: acme-wecom
+        enabled: true
+        workspace_id: ww_acme_corp
+        application_id: "1000002"
+        token_env: ACME_WECOM_CORP_SECRET
+        signing_secret_env: ACME_WECOM_CALLBACK_TOKEN
+        encryption_key_env: ACME_WECOM_ENCODING_AES_KEY
+        max_message_length: 2048
     data:
       session: {type: redis, dsn_env: REDIS_URL, namespace: acme-session}
       memory: {type: redis, dsn_env: REDIS_URL, namespace: acme-memory}

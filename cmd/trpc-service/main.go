@@ -97,7 +97,7 @@ func run(configPath string) error {
 		return err
 	}
 	httpClient := &http.Client{Timeout: 15 * time.Second}
-	channelRegistry := channels.NewRegistry(channels.NewTelegram(httpClient), channels.NewSlack(httpClient))
+	channelRegistry := channels.NewRegistry(channels.NewTelegram(httpClient), channels.NewSlack(httpClient), channels.NewWeCom(httpClient))
 	coordinator, err := buildCoordinator(cfg.Coordination)
 	if err != nil {
 		return err

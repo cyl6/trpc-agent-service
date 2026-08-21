@@ -61,6 +61,20 @@ Binding: {
 
 当前 Slack 绑定已保存并校验工作区/应用 ID；生产还应保存 secret 版本、轮换生效区间、Webhook 状态和最近验签时间。轮换期间只允许“当前+下一”两把签名密钥短暂重叠，成功切换后撤销旧值。路径不可枚举、IP allowlist 和 mTLS 可作为额外防线，但不能替代平台验签。
 
+### 企业微信（WeCom）
+
+企业微信与 Telegram/Slack 的关键差异是：回调**整体加密**（AES-256-CBC）而非明文加签名字段，且存在一次性的 URL 验证流程。
+
+- 接入配置：`workspace_id` 存 corpid，`application_id` 存自建应用 agentid，`token_env` 存应用 secret（换取 access_token），`signing_secret_env` 存回调 Token，`encryption_key_env` 存回调 EncodingAESKey。三者缺一不可，配置校验会拒绝缺失。
+- URL 验证（GET）：企业微信注册回调 URL 时发送 `echostr` 挑战。服务端先验 `SHA1(sort(token, timestamp, nonce, echostr))`，再 AES 解密，校验明文尾部的 receiveID 等于绑定 corpid，最后以 `text/plain` 原样回显解密明文。路由层新增了 `GET /webhooks/{channel}/{binding}`，仅实现 `channels.URLVerifier` 的 Adapter 响应，其余返回 405。
+- 消息回调（POST）：body 为 XML 信封，只有 `Encrypt` 一个字段。验签 `SHA1(sort(token, timestamp, nonce, Encrypt))` 常量时间比较，随后 AES-256-CBC 解密（IV=key 前 16 字节，PKCS#7，明文为 `random(16B)+len(4B)+msg+receiveID`）。时间戳超出 ±5 分钟拒绝，防重放语义与 Slack 一致。
+- 租户绑定：解密后 receiveID 必须等于绑定 corpid，明文 `ToUserName` 再次复核；`AgentID` 与绑定 `application_id` 强制比较——同一企业多个自建应用共用回调域时不会跨应用路由，语义对齐 Slack 的 `team_id/api_app_id` 检查。
+- 身份与 scope：`FromUserName`（userid）为单聊身份；回调带 `ChatId` 时按群聊处理（`appchat/send` 回复）。幂等键为 `MsgId`，缺失时退化为 `target:CreateTime`。
+- 出站：corpid+secret 经 `gettoken` 换取 access_token，进程内按 (corpid, secret) 缓存至过期前 5 分钟；单聊走 `message/send`（`touser`+`agentid`），群聊走 `appchat/send`（`chatid`）。`errcode 40014/42001` 触发一次刷新重试。企业微信会重投未及时 ACK 的回调，平台以 5 秒为超时阈值；本服务收到回调立即 202（企业微信不解析 body 内容），Agent 结果一律主动发送，不做被动加密回复。
+- 长度语义：企业微信文本上限是 **2048 UTF-8 字节**（不是 rune 数），拆分器按字节回退到 rune 边界，不会截断多字节字符——与 Telegram/Slack 的 rune 拆分器是两条独立代码路径。
+- 附件：`Image.MediaId`/`File.MediaId` 仅解析引用与文件名，媒体内容处理与其它通道一样属于生产附件流水线范围。
+- 事件类回调（如 `subscribe`）解析后返回 ignored，不进入 Agent。
+
 ## 3. 入站规范化
 
 通用模型字段为：
@@ -79,16 +93,16 @@ Binding: {
 
 具体映射：
 
-| 通用字段 | Telegram | Slack |
-| --- | --- | --- |
-| message ID | `update_id`；缺失时 `chat.id:message_id` | `event_id`；缺失时 `channel:ts` |
-| user | `message.from.id` | `event.user` |
-| conversation | `message.chat.id` | `event.channel` |
-| thread | `message_thread_id` | `event.thread_ts`；频道根消息使用自身 `ts`，与后续 thread 回复保持一致 |
-| scope | `chat.type == private` 为 direct，否则 group | `channel_type == im` 为 direct，否则 group |
-| text | `text`，空则用 `caption` | `event.text` |
-| image/file | 选择 Telegram 最大 photo 的 `file_id`，或 document 引用 | `files[]` 的 ID/名称/MIME/私有 URL 引用 |
-| reply target | `chat.id` | `channel` |
+| 通用字段 | Telegram | Slack | 企业微信 |
+| --- | --- | --- | --- |
+| message ID | `update_id`；缺失时 `chat.id:message_id` | `event_id`；缺失时 `channel:ts` | `MsgId`；缺失时 `ChatId/userid:CreateTime` |
+| user | `message.from.id` | `event.user` | `FromUserName`（userid） |
+| conversation | `message.chat.id` | `event.channel` | `ChatId`，无则 userid（单聊） |
+| thread | `message_thread_id` | `event.thread_ts`；频道根消息使用自身 `ts`，与后续 thread 回复保持一致 | 不适用（无子线程概念） |
+| scope | `chat.type == private` 为 direct，否则 group | `channel_type == im` 为 direct，否则 group | 回调带 `ChatId` 为 group，否则 direct |
+| text | `text`，空则用 `caption` | `event.text` | `Content` |
+| image/file | 选择 Telegram 最大 photo 的 `file_id`，或 document 引用 | `files[]` 的 ID/名称/MIME/私有 URL 引用 | `Image.MediaId` / `File.MediaId`+`FileName` |
+| reply target | `chat.id` | `channel` | group 为 `ChatId`，direct 为 userid |
 
 当前实现会解析附件元数据，Worker 把安全的 `type/name/MIME` 作为文本标记附在用户消息中，但刻意不把 file ID、私有 URL 或文件内容交给模型；出站也只发送文本。它因此是“附件识别/元数据提示”的部分实现，不能声称已有图片理解、文件内容处理或文件回复。
 
@@ -101,7 +115,7 @@ Binding: {
 ```mermaid
 sequenceDiagram
     autonumber
-    participant IM as Telegram / Slack
+    participant IM as Telegram / Slack / 企业微信
     participant G as Gateway
     participant A as Channel Adapter
     participant Q as In-process Queue
@@ -197,7 +211,7 @@ sequenceDiagram
 
 ## 7. 平台限制与降级矩阵
 
-当前默认最大文本长度是 Telegram 4096、Slack 40000 个 Go rune；这些是**实现配置默认值**，部署时应按所用 API 版本复核，不应当作永远不变的平台合同。当前拆分按 rune 边界，不理解 grapheme cluster、Markdown 代码块、Slack blocks 或 Telegram entity offset。
+当前默认最大文本长度是 Telegram 4096、Slack 40000 个 Go rune、企业微信 2048 UTF-8 字节；这些是**实现配置默认值**，部署时应按所用 API 版本复核，不应当作永远不变的平台合同。Telegram/Slack 按 rune 边界拆分，企业微信按字节限制拆分并回退到 rune 边界；两者都不理解 grapheme cluster、Markdown 代码块、Slack blocks 或 Telegram entity offset。
 
 | 限制/能力 | 当前最小实现 | 生产推荐 |
 | --- | --- | --- |
@@ -228,7 +242,7 @@ sequenceDiagram
 
 ## 9. Adapter 测试与接入新平台清单
 
-现有自动测试覆盖 Telegram 验签/解析、Slack HMAC/时间窗口/challenge/解析、rune 拆分、Gateway 先验签后分发、binding 反推 tenant。新增企业微信、微信客服、公众号等 Adapter 时至少补齐：
+现有自动测试覆盖 Telegram 验签/解析、Slack HMAC/时间窗口/challenge/解析、企业微信 AES 加密回调验签/解密/URL 验证/corpid 与 agentid 绑定/token 缓存与过期重试/字节拆分、rune 拆分、Gateway 先验签后分发、binding 反推 tenant。新增微信客服、公众号等 Adapter 时至少补齐：
 
 1. 官方签名与加密消息测试向量，含时间重放、错误 key、畸形 body 和 challenge。
 2. 私聊、群聊、thread/topic、机器人回环、消息编辑/撤回等事件夹具。

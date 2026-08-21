@@ -92,6 +92,7 @@ type ChannelConfig struct {
 	Enabled          bool     `yaml:"enabled" json:"enabled"`
 	TokenEnv         string   `yaml:"token_env" json:"token_env,omitempty"`
 	SigningSecretEnv string   `yaml:"signing_secret_env" json:"signing_secret_env,omitempty"`
+	EncryptionKeyEnv string   `yaml:"encryption_key_env" json:"encryption_key_env,omitempty"`
 	APIBaseURL       string   `yaml:"api_base_url" json:"api_base_url,omitempty"`
 	AllowedUsers     []string `yaml:"allowed_users" json:"allowed_users,omitempty"`
 	MaxMessageLength int      `yaml:"max_message_length" json:"max_message_length,omitempty"`
@@ -198,6 +199,9 @@ func applyDefaults(c *Config) {
 					t.Channels[j].MaxMessageLength = 4096
 				case "slack":
 					t.Channels[j].MaxMessageLength = 40000
+				case "wecom":
+					// WeCom limits text content to 2048 UTF-8 bytes.
+					t.Channels[j].MaxMessageLength = 2048
 				default:
 					t.Channels[j].MaxMessageLength = 4000
 				}
@@ -275,7 +279,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		for _, ch := range t.Channels {
-			if ch.Type != "telegram" && ch.Type != "slack" {
+			if ch.Type != "telegram" && ch.Type != "slack" && ch.Type != "wecom" {
 				return fmt.Errorf("config: tenant %s has unsupported channel %q", t.TenantID, ch.Type)
 			}
 			if !safeID.MatchString(ch.BindingID) {
@@ -286,6 +290,19 @@ func (c *Config) Validate() error {
 			}
 			if ch.Type == "slack" && (!safeRevision.MatchString(ch.WorkspaceID) || !safeRevision.MatchString(ch.ApplicationID)) {
 				return fmt.Errorf("config: tenant %s Slack channel %s requires valid workspace_id and application_id", t.TenantID, ch.BindingID)
+			}
+			if ch.Type == "wecom" {
+				// workspace_id is the corpid and application_id is the numeric
+				// agentid; both bind the encrypted callback to one app.
+				if !safeRevision.MatchString(ch.WorkspaceID) || !safeRevision.MatchString(ch.ApplicationID) {
+					return fmt.Errorf("config: tenant %s WeCom channel %s requires valid workspace_id (corpid) and application_id (agentid)", t.TenantID, ch.BindingID)
+				}
+				if ch.EncryptionKeyEnv == "" {
+					return fmt.Errorf("config: tenant %s WeCom channel %s requires encryption_key_env", t.TenantID, ch.BindingID)
+				}
+				if err := validateOptionalEnvReference("channel encryption_key_env", ch.EncryptionKeyEnv); err != nil {
+					return err
+				}
 			}
 			if err := validateOptionalEnvReference("channel token_env", ch.TokenEnv); err != nil {
 				return err
@@ -418,6 +435,7 @@ func (t TenantConfig) SecretEnvNames() []string {
 	for _, ch := range t.Channels {
 		add(ch.TokenEnv)
 		add(ch.SigningSecretEnv)
+		add(ch.EncryptionKeyEnv)
 	}
 	for _, backend := range []BackendConfig{t.Data.Session, t.Data.Memory, t.Data.Summary, t.Data.Artifact, t.Data.Knowledge, t.Data.AuditLog} {
 		add(backend.DSNEnv)

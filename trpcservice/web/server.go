@@ -86,6 +86,7 @@ func (s *Server) routes() {
 	})
 	s.mux.Handle("GET /metrics", s.metrics)
 	s.mux.HandleFunc("POST /webhooks/{channel}/{binding}", s.webhook)
+	s.mux.HandleFunc("GET /webhooks/{channel}/{binding}", s.webhookURLVerify)
 	s.mux.HandleFunc("POST /v1/chat/{tenant}", s.requireAdmin(s.directChat))
 	s.mux.HandleFunc("GET /admin/v1/tenants", s.requireAdmin(s.listTenants))
 	s.mux.HandleFunc("POST /admin/v1/reload", s.requireAdmin(s.reload))
@@ -162,6 +163,42 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 	}
 	s.metrics.Add("im_callbacks_total", "Inbound IM callback attempts.", 1, map[string]string{"tenant": binding.Tenant.TenantID, "channel": channelType, "result": "accepted"})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// webhookURLVerify serves providers that register the callback URL with a GET
+// challenge (WeCom echoes a decrypted random string). Only adapters opting in
+// via channels.URLVerifier are accepted; others get an explicit 405.
+func (s *Server) webhookURLVerify(w http.ResponseWriter, r *http.Request) {
+	_, span := tracer.Start(r.Context(), "im.url_verify", oteltrace.WithNewRoot())
+	defer span.End()
+	channelType := r.PathValue("channel")
+	bindingID := r.PathValue("binding")
+	binding, err := s.tenants.ResolveBinding(channelType, bindingID)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	span.SetAttributes(attribute.String("tenant.id", binding.Tenant.TenantID), attribute.String("channel", channelType))
+	adapter, err := s.channels.Get(channelType)
+	if err != nil {
+		http.Error(w, "channel unavailable", http.StatusNotFound)
+		return
+	}
+	verifier, ok := adapter.(channels.URLVerifier)
+	if !ok {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	echo, err := verifier.VerifyURL(r, binding.Channel)
+	if err != nil {
+		span.SetStatus(codes.Error, "invalid_signature")
+		s.metrics.Add("im_callbacks_total", "Inbound IM callback attempts.", 1, map[string]string{"tenant": binding.Tenant.TenantID, "channel": channelType, "result": "invalid_signature"})
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	s.metrics.Add("im_callbacks_total", "Inbound IM callback attempts.", 1, map[string]string{"tenant": binding.Tenant.TenantID, "channel": channelType, "result": "verified"})
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, echo)
 }
 
 type directRequest struct {

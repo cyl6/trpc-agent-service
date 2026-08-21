@@ -270,7 +270,7 @@ func (s *Service) Process(ctx context.Context, task Task) (result Result, err er
 	cost := (float64(promptTokens)*task.Tenant.Model.InputPrice + float64(completionTokens)*task.Tenant.Model.OutputPrice) / 1_000_000
 	outbound := domain.OutboundMessage{
 		TenantID: task.Tenant.TenantID, BindingID: task.Binding.BindingID, Channel: task.Binding.Type,
-		Target: msg.ReplyTarget, ThreadID: msg.ThreadID, Text: text,
+		Target: msg.ReplyTarget, ThreadID: msg.ThreadID, Scope: msg.Scope, Text: text,
 	}
 	pending = pendingResult{
 		Outbound: outbound, RequestID: requestID,

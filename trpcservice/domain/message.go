@@ -49,6 +49,7 @@ type OutboundMessage struct {
 	Channel     string       `json:"channel"`
 	Target      string       `json:"target"`
 	ThreadID    string       `json:"thread_id,omitempty"`
+	Scope       Scope        `json:"scope,omitempty"`
 	Text        string       `json:"text"`
 	Attachments []Attachment `json:"attachments,omitempty"`
 }

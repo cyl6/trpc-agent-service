@@ -54,6 +54,17 @@ tenants:
         token_env: ACME_SLACK_BOT_TOKEN
         signing_secret_env: ACME_SLACK_SIGNING_SECRET
         max_message_length: 40000
+      # 企业微信自建应用：回调走 AES-256-CBC 加密 + SHA1 验签，
+      # 回复走 message/send（单聊）/appchat/send（群聊）。
+      - type: wecom
+        binding_id: acme-wecom
+        enabled: true
+        workspace_id: ww_acme_corp          # corpid，同时用于回调 receiveID 校验
+        application_id: "1000002"           # 自建应用 agentid，防止跨应用路由
+        token_env: ACME_WECOM_CORP_SECRET   # 自建应用 secret（换取 access_token）
+        signing_secret_env: ACME_WECOM_CALLBACK_TOKEN   # 回调配置的 Token
+        encryption_key_env: ACME_WECOM_ENCODING_AES_KEY # 回调配置的 EncodingAESKey
+        max_message_length: 2048
     data:
       session: {type: inmemory, namespace: acme-session}
       memory: {type: inmemory, namespace: acme-memory}

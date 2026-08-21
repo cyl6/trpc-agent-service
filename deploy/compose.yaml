@@ -18,6 +18,9 @@ services:
       ACME_TELEGRAM_WEBHOOK_SECRET: ${ACME_TELEGRAM_WEBHOOK_SECRET:-local-development-webhook-secret}
       ACME_SLACK_BOT_TOKEN: ${ACME_SLACK_BOT_TOKEN:-unused-local-token}
       ACME_SLACK_SIGNING_SECRET: ${ACME_SLACK_SIGNING_SECRET:-local-development-signing-secret}
+      ACME_WECOM_CORP_SECRET: ${ACME_WECOM_CORP_SECRET:-unused-local-token}
+      ACME_WECOM_CALLBACK_TOKEN: ${ACME_WECOM_CALLBACK_TOKEN:-local-development-callback-token}
+      ACME_WECOM_ENCODING_AES_KEY: ${ACME_WECOM_ENCODING_AES_KEY:-}
       GLOBEX_TELEGRAM_BOT_TOKEN: ${GLOBEX_TELEGRAM_BOT_TOKEN:-unused-local-token}
       GLOBEX_TELEGRAM_WEBHOOK_SECRET: ${GLOBEX_TELEGRAM_WEBHOOK_SECRET:-local-development-webhook-secret}
     ports:

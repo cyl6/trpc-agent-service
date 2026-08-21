@@ -42,11 +42,11 @@
 
 | ID | 原始要求 | 当前状态与代码证据 | 验收方式 | 生产设计证据 |
 | --- | --- | --- | --- | --- |
-| I-01 | 至少支持两类 IM | **已实现**：[telegram.go](../trpcservice/channels/telegram.go) 与 [slack.go](../trpcservice/channels/slack.go) 注册到统一 Adapter Registry | `TestTelegramVerifyAndParse`、`TestSlackVerifyParseAndRejectReplay` | [IM §1–2](im-adapters.md#1-adapter-契约与能力模型) |
+| I-01 | 至少支持两类 IM（含微信/企业微信） | **已实现**：[telegram.go](../trpcservice/channels/telegram.go)、[slack.go](../trpcservice/channels/slack.go)、[wecom.go](../trpcservice/channels/wecom.go) 注册到统一 Adapter Registry；企业微信覆盖 AES 加密回调验签解密、URL 验证、corpid/agentid 绑定、单聊/群聊分流与字节级拆分 | `TestTelegramVerifyAndParse`、`TestSlackVerifyParseAndRejectReplay`、`TestWeComVerifyParseDirectMessage`、`TestWeComParseGroupChatAndBindingChecks`、`TestWeComURLVerification` | [IM §1–2](im-adapters.md#1-adapter-契约与能力模型)（含企业微信章节） |
 | I-02 | 外部消息→tRPC-Agent 输入；Agent Event→回复/流/卡片 | **部分实现**：规范消息→Runner；Event stream 聚合成最终文本；附件仅安全元数据提示；无增量编辑/卡片/附件出站 | Adapter 测试、`TestAttachmentMetadataIsPassedWithoutProviderCredentialedURL`、mock direct chat | [IM §3–4](im-adapters.md#3-入站规范化) 给出 ReplyOp/流式/card 降级 |
-| I-03 | 账号租户绑定、URL/token/secret/验签/去重/身份映射 | **部分实现**：绑定、env secret、Telegram header、Slack HMAC+时间窗、消息 claim、身份 hash 已有；去重不 durable | Gateway 签名先于 dispatch 测试、binding collision 测试、重复消息测试 | [IM §2、§5–6](im-adapters.md#2-webhook账号与租户绑定) |
-| I-04 | 群聊/单聊 session_id 与跨群/跨租户隔离 | **已实现**：单聊按用户，群聊按 conversation/thread 共享 principal；tenant/app/binding/channel/scope 都入 hash | `TestIdentityIsolationAndConversationRules`、`TestGroupMembersShareOneRunnerSession` | [IM §5](im-adapters.md#5-单聊群聊与身份隔离) |
-| I-05 | 长度、频率、异步、图片/文件、撤回、失败重试 | **部分实现**：rune 拆分、租户入站 RPM、callback 后异步、本进程 3 次重试、附件元数据；无出站限频/Retry-After/内容下载/撤回 | `TestChunksUsesRuneLength`、flaky Adapter 测试；其余做负向能力检查 | [IM §6–7](im-adapters.md#7-平台限制与降级矩阵) 完整能力/降级矩阵 |
+| I-03 | 账号租户绑定、URL/token/secret/验签/去重/身份映射 | **部分实现**：绑定、env secret、Telegram header、Slack HMAC+时间窗、企业微信 AES 验签解密+URL 验证、消息 claim、身份 hash 已有；去重不 durable | Gateway 签名先于 dispatch 测试、binding collision 测试、重复消息测试、`TestWeComURLVerification` | [IM §2、§5–6](im-adapters.md#2-webhook账号与租户绑定) |
+| I-04 | 群聊/单聊 session_id 与跨群/跨租户隔离 | **已实现**：单聊按用户，群聊按 conversation/thread 共享 principal；tenant/app/binding/channel/scope 都入 hash；企业微信 `ChatId` 群聊与 userid 单聊同规则 | `TestIdentityIsolationAndConversationRules`、`TestGroupMembersShareOneRunnerSession`、`TestWeComParseGroupChatAndBindingChecks` | [IM §5](im-adapters.md#5-单聊群聊与身份隔离) |
+| I-05 | 长度、频率、异步、图片/文件、撤回、失败重试 | **部分实现**：rune 拆分（Telegram/Slack）、字节拆分（企业微信 2048B）、租户入站 RPM、callback 后异步、本进程 3 次重试、附件元数据、企业微信 access_token 缓存与过期重试；无出站限频/Retry-After/内容下载/撤回 | `TestChunksUsesRuneLength`、`TestChunksUTF8BytesSplitsOnRuneBoundary`、`TestWeComDeliverCachesTokenSplitsBytesAndRoutesByScope`、`TestWeComDeliverRetriesOnceOnExpiredTokenWithoutLeakingSecret`、flaky Adapter 测试；其余做负向能力检查 | [IM §6–7](im-adapters.md#7-平台限制与降级矩阵) 完整能力/降级矩阵 |
 
 ## 4. 治理、监控和安全
 
@@ -90,7 +90,7 @@ go vet ./...
 | 测试 | 证明什么 | 不能证明什么 |
 | --- | --- | --- |
 | config decode/default/unknown/collision | 配置严格、secret 使用引用、binding 不跨租户复用 | 多节点配置发布与 Vault 轮换 |
-| Telegram/Slack Adapter | 原始请求验签、重放时间窗、规范消息映射、文本拆分、Telegram 错误不泄露 token | 真实平台限流/权限变化/所有事件类型 |
+| Telegram/Slack/企业微信 Adapter | 原始请求验签、重放时间窗、规范消息映射、文本拆分（rune 与字节两路径）、企业微信 AES 回调/URL 验证、Telegram 与企业微信错误不泄露 token/secret | 真实平台限流/权限变化/所有事件类型 |
 | Gateway binding/signature | tenant 来自已验证服务端 binding，验签失败不 dispatch | 持久 ACK；当前 queue 在内存 |
 | identity/group tests | ID 稳定、群上下文共享、跨租户隔离 | HMAC 密钥轮换、账号合并 |
 | worker continuity/concurrency/Redis | 单机相同 session 串行、不同租户状态分离、独立 Runtime 共享 Redis Session/Memory | Redis 租约失锁后的陈旧写防护 |

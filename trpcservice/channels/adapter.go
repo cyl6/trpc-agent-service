@@ -31,6 +31,13 @@ type Adapter interface {
 	Deliver(ctx context.Context, binding config.ChannelConfig, msg domain.OutboundMessage) error
 }
 
+// URLVerifier is implemented by adapters whose provider verifies the callback
+// URL with a GET challenge (e.g. WeCom echoes a decrypted random string). The
+// returned plaintext must be written back as text/plain.
+type URLVerifier interface {
+	VerifyURL(r *http.Request, binding config.ChannelConfig) (string, error)
+}
+
 type Registry struct {
 	mu       sync.RWMutex
 	adapters map[string]Adapter
