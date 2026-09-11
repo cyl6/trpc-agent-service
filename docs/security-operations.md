@@ -24,12 +24,13 @@
 | --- | --- | --- |
 | IM 用户权限 | binding 的 `allowed_users` 与原始外部用户 ID 精确比较 | 本进程即可判断；未接企业目录/组角色 |
 | 输入大小 | 对模型实际收到的正文、群 sender 标注和安全附件元数据按 Unicode rune 计入 `max_input_chars`；附件最多 8 个且 name/MIME/type 分别限长 | 不等于模型 tokenizer；附件字节、下载和病毒扫描仍需独立限制 |
-| 请求预算 | 每租户、本进程、固定分钟窗 RPM | 多节点各自计数，重启清零，边界有突发 |
-| 月成本预算 | 根据完整规范输入约 4 rune/token、模型 max output、价格和最多 8 次 LLM 调用包络做保守预留 | 未包含动态历史/system/tool 上下文；本进程内存账本，无 actual settle/退款，多节点可超卖 |
+| 请求预算 | Redis 服务端时间驱动的每租户固定 60 秒窗口 RPM；Lua 原子递增与限额判断 | Redis 故障 fail-closed；InMemory 仅测试/demo，不能跨节点共享 |
+| 月成本预算 | PostgreSQL 006 用量账本按每个真实 provider 调用预留/结算；固定点 1e-8 USD，按预留时 UTC 月份归属 | 预估仍受动态上下文影响；可靠 usage 才 settle，unknown 不退款并继续占用额度 |
 | 工具白名单 | `ToolFilter` 隐藏非 allow 工具，deny 优先 | 只控制可见性，不作为唯一授权 |
-| 工具执行权限 | `PermissionPolicy` 在每次调用重验 allow/deny | 覆盖框架动态注入工具，默认拒绝未知工具 |
-| 危险工具确认 | 一次性 nonce，绑定租户、revision、用户、session、工具和参数 hash，5 分钟过期 | nonce store 在进程内；多节点/重启不共享 |
-| 工具决策观测 | permission observer 记录允许/拒绝/询问、tool_name、参数 hash和指标 | 记录授权决策，不等于工具副作用结果审计 |
+| 工具执行权限 | 组合后的 `PermissionPolicy` 在每次调用重验 allow/deny/confirmation，且只在最终 allow 后进入副作用 guard | 覆盖框架动态注入工具，默认拒绝未知工具；工具自身资源级授权仍由后端实施 |
+| 危险工具确认 | 一次性 nonce，绑定租户、revision、用户、session、工具和参数 hash，5 分钟过期 | `coordination=redis` 复用共享 Redis、TTL 与原子消费；`inmemory` 才是进程内，Redis 丢失/消费结果不确定时拒绝授权 |
+| 工具副作用账本 | `tools.side_effects` 显式分类；tenant/app/session/稳定 turn/config revision/tool/规范参数生成 revision-scoped intent key。最终授权后才 reserve/lease/mark executing，成功结果落 `confirmed`；普通错误、崩溃或结果落账失败停在 `unknown`，只有明确“未应用”的 typed error 可重试 | PostgreSQL Queue 使用 003 持久账本，Memory 模式不跨重启；它是 dispatch fence，不与外部 provider 原子提交，也不能代替 provider 原生幂等键或查询接口 |
+| 工具决策与结果观测 | observer 记录 allow/deny/ask、tool_name、参数 hash；side-effect guard 另记录 operation key、phase/state、指标、trace 与审计 | 不保存原始参数、owner、provider response；`unknown` 仍需平台查询、对账或人工 CAS 决议 |
 | 敏感信息 | 审计 Reason/Error 脱敏；内容只记 hash；trace 丢弃 LLM 消息正文 | 尚无入模前 PII tokenization 或出站 DLP Filter |
 
 ### 2.2 生产 Filter 顺序
@@ -46,6 +47,9 @@ flowchart LR
     RUN --> TF[Tool visibility filter]
     TF --> TP[Execution permission policy]
     TP --> CONFIRM[Scoped confirmation]
+    CONFIRM --> FENCE[Side-effect lookup / reserve / dispatch fence]
+    FENCE --> EXEC[Tool execution]
+    EXEC --> FINALIZE[Result hash + confirmed / unknown]
     RUN --> DLP[Output DLP / policy]
     DLP --> OUT[Outbox]
 ```
@@ -63,14 +67,16 @@ PII Filter 按租户选择 `block`、`mask`、`tokenize` 或经审批的 `allow`
 
 ### 2.3 分布式预算
 
-生产预算采用 Redis Lua 或 SQL 条件更新做原子 reserve：
+当前实现的职责边界是：Redis 只做共享请求限流，PostgreSQL Queue 数据库只做持久模型用量账本；二者都不可用时分别 fail-closed，不能静默降级到本地计数器或内存账本。
+
+PostgreSQL 预算采用行锁事务做原子 reserve：
 
 1. 以模型上限估算 `reserved_cost`，执行 `spent + reserved + estimate <= limit`。
-2. 模型结束按 provider usage 原子 settle，多退少补；超额补差触发后续熔断而不篡改已完成结果。
-3. 超时/取消按供应商实际 usage 结算；未知账单进入 reconciliation。
+2. 模型结束按 provider usage 原子 settle，多退少补；实际费用超过预估时保留完整实际费用，不丢失超额。
+3. 超时、断流、响应缺失 usage 或费用无法确认转 `unknown`，金额继续计入已用额度，不自动退款；只有确认 provider 请求尚未发出才能 `released`。
 4. 设置每分钟请求、并发 run、token/min、工具调用、出站发送和月成本多维限制。
 
-配额 key 包含 tenant 和 UTC billing period，保留账本/审计，不以进程内缓存为事实源。对高价值管理请求可配置保留额度，避免普通流量耗尽全部预算。
+配额 key 包含 tenant 和 UTC billing period，保留账本/审计，不以进程内缓存为事实源。每次实际 provider 调用使用新的 `run_id + call_no`/`call_id`；消息 replay 只读取已持久化结果不扣费，实际 retry/failover/第二次调用生成新记录并计费。结算永远写回调用预留时的原账期，即使跨月完成。
 
 ## 3. 密钥管理与脱敏
 
@@ -82,7 +88,7 @@ PII Filter 按租户选择 `block`、`mask`、`tokenize` 或经审批的 `allow`
 - 审计默认只写 `content_hash`/`tool_args_hash`，Reason 与 ErrorType 经过邮箱、手机号、常见 secret 模式和已配置 secret 值替换。
 - `trpc-agent-go` 的 Chat/InvokeAgent/ExecuteTool/Workflow spans 在源端 Drop LLM request/response、输入输出消息、system instruction、tool definitions/arguments/results 与 workflow payload；其中 system instruction 的框架直写路径已改为 policy-aware 并有回归测试。Collector 按框架实际属性名再次删除，并通过 transform 清空 status message 与 exception message/stack。
 
-限制：环境变量对同一进程可见，缺少租户级动态轮换；Telegram token 仍出现在出站 URL，反向代理/access log 必须特别处理；自定义错误文本或第三方 SDK 日志仍需审计；Admin API 只有单一共享 Bearer token，没有角色和变更审批。
+限制：环境变量对同一进程可见，真正的 Vault/云 Secret Manager 轮换由部署侧 SecretResolver 实现；Telegram token 仍出现在出站 URL，反向代理/access log 必须特别处理；自定义错误文本或第三方 SDK 日志仍需审计。生产配置拒绝共享 Bearer token，改用 OIDC/JWKS 的 viewer/operator/security-admin 角色和 tenant scope；local/demo 才保留单 token 兼容路径。
 
 ### 3.2 生产方案
 
@@ -105,9 +111,19 @@ PII Filter 按租户选择 `block`、`mask`、`tokenize` 或经审批的 `allow`
 | `agent_requests_total` | Worker success/error |
 | `agent_request_latency_seconds_sum/count` | 端到端 Worker 耗时 |
 | `im_delivery_total` | IM 投递 success/error |
-| `model_tokens_total` | prompt + completion token |
-| `tenant_cost_usd_total` | 按配置价格估算的实际 usage 成本 |
+| `queue_outbox_attempts_total` | provider operation attempt 的 confirmed/retryable_not_sent/permanent_rejected/unknown |
+| `queue_outbox_uncertain_total` | 新增的未知投递结果；必须告警并进入对账/人工决议 |
+| `queue_outbox_resolutions_total` | unknown 的 assume_delivered/retry/cancel 人工决议 |
+| `queue_depth{component="outbox_uncertain"}` | 当前停车且阻塞 Session lane 的 operation 数 |
+| `queue_inbox_legacy_pipeline_total` | 以 `pipeline_schema_version=0` 兼容双事务排空的遗留 Inbox |
+| `queue_inbox_pipeline_rejected_total` | 因当前协议格式或 Task/Inbox 元数据漂移而被永久拒绝的 Inbox |
+| `queue_inbox_pipeline_blocked_total` | 因未来版本、required 能力暂缺或数据库 identity 不匹配而停放的 Inbox；不消耗死信尝试预算 |
+| `queue_inbox_processing_blocked_total` | 因工具结果 unknown、同 intent 执行中或等待 confirmed replay 而停放的 Inbox；与 pipeline rollout 指标分离且不消耗死信尝试预算 |
+| `model_tokens_total` | 已结算实际 provider prompt + completion token；replay 不重复增加 |
+| `tenant_cost_usd_total` | 已结算实际 usage 成本；每个真实 model call 更新一次 |
+| `model_usage_unknown_total` / `tenant_unknown_cost_usd_total` | provider usage/费用未知的调用和其保留金额；unknown 不自动退款 |
 | `tool_permission_total` | 工具 allow/deny/ask 决策 |
+| `tool_side_effect_operations_total` | 副作用工具 dispatch/confirmed/unknown/replay/resolve 等低基数阶段与结果 |
 
 Exporter 只接受 `tenant/component/result/channel/backend` 标签，主动丢弃 request/user/session/trace ID，避免高基数。`Observe` 当前只有 sum/count，不是可计算 P95/P99 的 histogram。配置 OTLP 后还会初始化 `trpc-agent-go` MeterProvider，把模型 operation duration、TTFT、token usage、Agent 与工具 duration histogram 发往 Collector 的 OTLP metrics pipeline，并由 `:9464` Prometheus exporter 暴露；平台 `/metrics` 与这组框架指标是两个互补出口。
 
@@ -147,6 +163,7 @@ flowchart LR
     F --> G[session.load]
     F --> H[model.generate]
     F --> I[tool.execute]
+    I --> P[tool operation fence]
     I --> J[external dependency]
     F --> K[session.commit]
     K --> L[outbox.insert]
@@ -165,12 +182,12 @@ flowchart LR
 timestamp, tenant_id, channel, binding_id, user_id, session_id,
 agent_name, tool_name, decision, reason, latency_ms, error_type,
 cost_usd, trace_id, request_id, config_revision,
-content_hash, tool_args_hash
+content_hash, tool_args_hash, operation_key, operation_phase, operation_state
 ```
 
-用户/Session 是租户作用域的伪匿名 ID；正文和工具参数只存 SHA-256 hash。入站 deny、完整 Agent allow 和工具 permission decision 都有写入路径。stdout/file Router 使用请求固定 revision 的策略与动态解析的该 revision secret 引用，reload 不会把在途旧请求路由到新 sink；file 权限为 `0600`。写失败增加 `audit_write_failures_total` 但不阻塞回复，因此审计存储故障仍可能丢记录，且 tool decision 的 latency/cost/error 还不完整。
+用户/Session 是租户作用域的伪匿名 ID；正文和工具参数只存 SHA-256 hash。入站 deny、完整 Agent allow、工具 permission decision 和副作用 operation 状态都有写入路径；operation key 是不含明文参数的 opaque hash。stdout/file Router 使用请求固定 revision 的策略与动态解析的该 revision secret 引用，reload 不会把在途旧请求路由到新 sink；file 权限为 `0600`。SQL sink 使用 008 `audit_records` 追加 hash chain；数据库不可用时只把已脱敏记录写入 `0600` JSONL spool 并 fsync，启动/后台 drain 在数据库提交后删除，损坏行隔离到 `.corrupt`。数据库与 spool 同时失败时 Worker 返回可重试错误，不确认消息完成；replay 使用稳定 audit ID 补写而不重复落账。
 
-生产审计必须包含：事件/工具 call ID、actor 类型、资源 scope、policy/rule version、输入输出 hash、approval ID/approver、工具副作用结果、重试次数和前一记录 hash。写入本地加密缓冲或 durable audit queue；高风险工具可配置审计不可用时 fail closed。中心存储 append-only/WORM、按租户 RBAC、保留期与 legal hold，使用链式 hash/批次签名检测篡改。定期对“业务完成数、工具调用数、审计记录数”做对账。
+生产审计必须包含：事件/工具 call ID、actor 类型、资源 scope、policy/rule version、输入输出 hash、approval ID/approver、工具副作用结果、重试次数和前一记录 hash。008 sink 已提供本地耐久 spool 与 SQL append-only chain；高风险工具对数据库与 spool 双失败 fail closed。中心存储仍应配置 WORM/RBAC/保留期/legal hold，使用链式 hash 检测篡改，并定期对“业务完成数、工具调用数、审计记录数”做对账。
 
 ## 7. 故障恢复与降级
 
@@ -180,16 +197,16 @@ content_hash, tool_args_hash
 
 | 故障 | 当前最小实现 | 生产检测与处理 | 恢复/对账 |
 | --- | --- | --- | --- |
-| Gateway 节点退出 | 未入队返回失败；已 202 的本进程任务可能丢 | LB 摘流；先持久 Inbox 再 ACK；多 AZ 副本 | 扫描 accepted/未 dispatch Inbox |
-| Worker 节点退出 | In-process 任务丢；Redis claim 到期后可重试 | durable queue lease 到期重投；状态 CAS/fencing 防陈旧写 | 查 processing 超时、tool ledger 和 Outbox |
+| Gateway 节点退出 | `inmemory` 已 202 任务可能丢；`postgres` 仅在 Inbox 提交后 202 | LB 摘流；持久 Inbox + 多 AZ 副本 | 扫描 accepted/未 dispatch Inbox |
+| Worker 节点退出 | `inmemory` 任务丢；Durable lease 过期后按 PostgreSQL 时钟 reclaim；同 DSN strict SQL 组合把 Session/Outbox/Inbox 一次提交，已 committed Turn 的补齐复用 canonical replay | queue attempt fencing、strict Session version/fencing、Inbox owner/attempt/身份/deadline 复核与组合事务已实现；仍需 SIGKILL、网络分区和 COMMIT ACK 不确定演练 | 查 processing/active turn 超时、canonical replay、tool ledger 和 Outbox |
 | IM 重投 | claim 去重；pending result 复用 | Inbox 唯一约束；已完成返回 ACK；Outbox 独立重试 | message/outbox ID 对账，未知发送结果人工判定 |
-| IM 429/5xx | worker 最多 3 次短重试，未解析 Retry-After | binding 令牌桶；Retry-After/指数退避+jitter；熔断和 DLQ | 平台恢复后限速 replay，防流量洪峰 |
+| IM 429/5xx/响应丢失 | `inmemory` 只在整个任务仍安全时重试 typed safe outcome，前序分片已确认则禁止整任务 replay；Durable 解析 Retry-After，429/明确未受理才退避，通用 5xx/网络/畸形成功响应转 unknown 停车 | binding 令牌桶；attempt/resolution ledger；unknown 告警与 CAS 决议；熔断/DLQ | 先查平台 message/request ID 或控制台，再确认、显式接受重复风险重试或取消；禁止全量盲 replay |
 | Session DB 短暂不可用 | Process 返回错误，队列短重试后仅记录日志 | 不运行模型；queue NACK/backoff；连接池隔离、熔断；可发持久化的延迟提示 | DB 恢复后按 session 顺序 drain，验证 event sequence |
-| Redis 协调不可用/锁丢失 | 请求失败；续约失败会通知并取消 run，但 Session 后端无 fencing/CAS，取消仍可能与状态写竞态 | queue partition + SQL CAS；租约返回 fencing token；失锁取消 run | 检测 CAS conflict/陈旧 token，重放事实事件 |
+| Redis 协调不可用/锁丢失 | 请求失败；续约失败会取消 run。InMemory/Redis Session 仍有取消与落库竞态；strict SQL Session 在 Commit 再校验 version/fence | SQL Session 路径已拒绝 takeover 后的陈旧 Handle；与同 DSN PostgreSQL Queue 组合时 Inbox lease owner/attempt/身份/deadline 也直接参与同一 Commit，其他组合没有此保证 | 检测 fence/version/lease conflict，从 committed replay 对账 |
 | Memory/向量不可用 | InMemory 不依赖远端；Redis Memory 操作会受 Redis 故障影响 | 对话可标记 degraded 并跳过非关键召回；显式“记住”按策略 fail | durable extraction 重放、检查 watermark/index lag |
 | 模型超时/429 | run timeout 默认 90 秒；整体任务可能短重试 | cancellation；只对未产生副作用且错误可重试的调用重试；同等级备用模型/安全模板 | 记录 provider request ID/usage；避免双计费，探针半开 |
-| 工具失败 | Runner 返回错误；permission 已记录 | 工具独立超时/熔断；只重试声明幂等工具；危险副作用查 ledger，不自动重做 | reconciliation 查询真实外部状态，人工补偿 |
-| Audit 后端失败 | 写错误被忽略 | 本地加密 WAL；高风险 fail closed；普通请求告警并缓冲 | WAL replay 与数量/hash 对账 |
+| 工具失败 | 只读工具沿 Runner 错误返回；副作用工具在最终 allow 后先写 dispatch fence。成功确认后同一 intent 返回脱敏 replay；普通错误、执行中 lease 过期或确认落账失败转 `unknown` 并阻塞自动重做，明确未应用的 typed error 才转安全重试 | 工具独立超时/熔断；工具后端接收 operation key 作为 provider 幂等键；`tool_side_effect_operations_total` unknown 告警 | 先用 provider 查询接口核实，再通过 tenant-scoped Admin API 做带 expected version/resolution ID 的 confirm、retry_not_applied 或 reject；无查询能力时人工补偿 |
+| Audit 后端失败 | SQL sink 失败转入 `0600`、fsync 的本地 spool，后台/重启后 drain；SQL 与 spool 双失败时 fail-closed | 部署侧提供卷加密、WORM 与容量告警 | spool replay 与数量/hash 对账 |
 | 配置服务失败 | 使用本进程最近快照 | 使用已验证 last-known-good，有 TTL 和 revision；禁止无配置启动新租户 | 服务恢复后签名校验、差异审计，不盲目覆盖 |
 
 故障状态可统一为：
@@ -209,9 +226,9 @@ stateDiagram-v2
 
 ### 8.1 当前最小实现
 
-`POST /admin/v1/reload` 重新读取 YAML并发布不可变 tenant 快照；顶层 server/coordination/telemetry 变化拒绝热更并要求重启。`POST /admin/v1/tenants/{tenant}/rollback` 回滚该租户。Registry 保留最多 10 个本进程历史版本并拒绝任何已见 version 的内容变更。Runtime 按 `(tenant, revision, digest)` singleflight 构建并缓存到停机，使延迟与在途请求继续使用原 revision。
+`control_plane.backend=postgres` 时，Queue PostgreSQL 的 007 migration 是配置事实源。`POST /admin/v1/reload` 导入 YAML 并创建持久 full release，`POST /admin/v1/tenants/{tenant}/rollback` 创建新的 rollback release；revision、generation、release/event、node ACK 和 heartbeat 都跨重启保留。`LISTEN/NOTIFY` 提供及时刷新，5 秒级轮询在通知连接故障时兜底。`inmemory` 仅供本地/demo/单元测试，生产 PostgreSQL 不可用或迁移校验失败会阻止启动。
 
-这不是分布式配置控制面：节点各自 reload、历史重启丢失、Admin 是单 Bearer token，也没有自动指标门禁。
+发布先等待全部目标节点 `prepared`，再推进 generation；节点应用 active/canary 后写 `applied`，只有全部 applied 才显示 `verified`。稳定灰度使用 `tenant + app + session` 的 SHA-256 分桶；在途 Task 保存完整 revision 快照，refresh/rollback 不改变其路由。节点故障、错误 boot、超时或加载错误不会伪造成功，Admin 以异步 pending/failed 状态返回。
 
 ### 8.2 生产发布流程
 
@@ -223,6 +240,24 @@ stateDiagram-v2
 6. 回滚后扫描新 revision 的 Inbox/Outbox/tool ledger，补偿其外部副作用；配置回滚不能自动撤销已发生业务操作。
 
 示例门禁（应按 SLO 配置而非硬编码）：新版本系统错误率较基线增加 >1 个百分点、P95 增加 >30%、每请求成本增加 >25%、IM 投递率低于 99%、任一跨租户/审计完整性告警，立即回滚。模型输出质量采用离线评测和人工抽检，不能只看基础设施指标。
+
+### 8.3 原子流水线滚动发布门禁
+
+Runtime Queue/strict Session 使用不可变 [002_runtime_pipeline.sql](../migrations/002_runtime_pipeline.sql)，副作用工具账本使用追加式 [003_tool_operations.sql](../migrations/003_tool_operations.sql)，后端数据迁移状态使用 [004_data_migrations.sql](../migrations/004_data_migrations.sql)，Artifact 恢复账本使用 [005_artifact_objects.sql](../migrations/005_artifact_objects.sql)，模型用量预算使用 [006_usage_budget.sql](../migrations/006_usage_budget.sql)，配置控制面使用 [007_config_control_plane.sql](../migrations/007_config_control_plane.sql)，Summary/Memory watermark/Audit/迁移对账使用 [008_data_lifecycle.sql](../migrations/008_data_lifecycle.sql)，生产内容安全租约使用 [009_production_safety.sql](../migrations/009_production_safety.sql)。独立 `trpc-migrate` 在共同的 transaction-scoped advisory lock 下按序执行 `ApplyAll` 并登记 SHA-256 checksum；Queue、Session、工具账本、用量账本、控制面、生命周期和内容安全业务启动只执行只读 `VerifyAll`，Artifact 还校验表结构、强制 RLS 与 DML 权限，缺失即 fail-closed，不会使用运行账号补建表。传入 `-config` 时，migrator 会使用只挂载到 Job 的 Artifact `migration_dsn_env` 迁移元数据库，并用 Knowledge `migration_dsn_env` 创建 PGVector extension/表；业务进程只持有各自 `dsn_env`。Compose 以 migration/runtime 两个 DSN 演示职责分离，并清除 runtime 角色的 superuser/createdb/createrole/inherit/bypassrls 及 `PUBLIC` schema/temp create，再显式授予 migration ledger SELECT 和 data-plane DML；Kubernetes 应先完成 migration Job，再发布具备等价最小授权的业务 Pod。生产凭据与授权仍需由 Secret Manager/IaC 管理，不能把 Compose 的本地口令或初始化脚本直接视为生产方案。
+
+推荐顺序：迁移身份执行 `trpc-migrate` 至 `LatestVersion`（当前为 009）→ 发布能读 legacy/v2、识别未来协议且具 side-effect guard 的 reader/Worker → 确认 strict SQL transaction participant、database identity、工具账本、用量账本、配置控制面、Summary jobs、watermark、Audit spool 和 content-safety lease backlog 健康 → 才启用 v2 required/副作用写路径 → 等 legacy backlog 归零后禁用旧 writer。回滚 binary 不回滚 schema，也不得修改已经登记 checksum 的迁移文件。
+
+Redis Session → SQL 的 `trpc-data-migrate` 只能使用一次性、具 004 ledger DML 权限的 `TRPC_AGENT_DATA_MIGRATION_DSN`，不要把该权限授予长驻 Runtime。开始前必须确认所有 Worker 已升级为会读取 coordination Redis tenant freeze 的版本；命令创建的 freeze 无 TTL，所有新任务以 blocked 停放，至少等待三分钟 drain 后才允许复制。每次恢复都会校验 migration ID、tenant、派生 app namespace、源环境变量名、Redis key prefix 和目标环境变量名与 ledger 一致。进入 `cutover` 后先在发布系统部署 SQL 路由，再推进验证；只有 complete/rolled_back 才能解冻。Redis Cluster、零停机双写和旧 Worker 混跑不在当前保证范围内。
+
+发布期间按以下状态处理和告警：
+
+- Task 无 pipeline 且 Inbox 为 `pipeline_schema_version=0`、模式/identity 为空时才是 legacy；允许以“Session Turn 事务 → canonical replay → Inbox/Outbox 事务”的兼容路径排空，观察 `queue_inbox_legacy_pipeline_total` 与 backlog，归零前不得删除兼容 reader。
+- v2 required 必须保持 Task/Inbox 元数据完全一致，并让 Queue、Session、事务连接的 database identity 一致。未来 schema version、required 能力暂缺、identity 不匹配应停放并延迟重试，不运行模型且不消耗死信尝试预算；`queue_inbox_pipeline_blocked_total` 持续增长或最老 parked Inbox 超阈值时冻结扩量，修复实例版本/能力/数据库路由后再 drain。
+- 部分空字段、非法 mode/identity 组合或当前 v2 的 Task/Inbox 漂移属于不可由滚动部署自行恢复的记录损坏，直接进入 dead letter 并告警；不得通过覆写元数据或降级为 legacy 来“修复”。
+
+真实 PostgreSQL 发布门禁必须显式提供隔离数据库并执行 `TEST_POSTGRES_DSN=... ./scripts/postgres-acceptance.sh`；脚本覆盖 migrations、Queue、Session、用量账本、配置控制面、数据迁移、Artifact、Agent、Worker、工具账本、Memory visibility、SQL Audit 和 Content Safety 共 14 个包，遇到任何 `SKIP`、失败或未执行均返回失败。未配置 `TEST_POSTGRES_DSN` 时集成用例会 skip，该结果不能当作 002–009 migration、同库身份、组合事务、预算账本、配置控制面、生命周期账本、内容安全或 PostgreSQL 工具账本已通过。
+
+2026-09-10 已使用任务专用临时 PostgreSQL 实际执行该门禁：14 个包全部 `PASS`，无 `SKIP`，容器在验收后已清理。
 
 ## 9. 容量评估
 
@@ -256,13 +291,23 @@ SQL transaction/s         Q_sql_tx = λ × (inbox_tx + turn_tx + outbox_delivery
 
 ## 10. 部署与运行手册
 
+### 10.1 生产部署验收与故障恢复
+
+生产 Compose overlay 位于 `deploy/compose.production.yaml`，由 HAProxy 接入两个 service 副本，并配套独立 migration/runtime PostgreSQL 凭据、Redis、MinIO、OTel Collector、Jaeger 和 OIDC fixture。Kubernetes 清单使用 RollingUpdate、PDB、节点/区域拓扑约束、`/-/drain` preStop、纯 liveness `/healthz` 和依赖感知 `/readyz`；SecretProviderClass 只提供引用，不把值写入 ConfigMap。
+
+`scripts/production-acceptance.sh` 必须无条件执行节点退出/reclaim、PostgreSQL 断连、提交 ACK 丢失 replay、内容安全租约接管、RBAC、依赖详情、trace 查询和 canary 扫描。任何 `SKIP`、失败、超时或未执行都返回非零，只有脚本成功后才可标记生产部署验收通过。审计 SQL/spool、预算、Session、Outbox、Safety 状态需要逐对象计数/hash 对账；replay 不再次运行模型、不重复扣费，真实 retry 才产生新调用记录。
+
+2026-09-10 的任务专用 Compose 演练已通过：双副本退出/reclaim、PostgreSQL 断连恢复、提交确认丢失 replay、内容安全租约接管、OIDC/RBAC、依赖健康、Jaeger storage 链路和 Secret canary 扫描均成功，`skips=0`、`unexecuted=0`。脱敏 summary：[production acceptance evidence](../evidence/production/summary-trpc-prod-acceptance-2392023385.txt)。
+
+管理端生产模式只接受 OIDC/JWKS：viewer 只读，operator 负责发布/回滚和受限运维，security-admin 才能管理密钥、审计和安全策略；URL tenant 必须落在 token scope 内。SecretResolver 只解析外部引用并 fail-closed，revision、数据库、audit、log、metrics 和 trace 只保存引用、版本或 hash。Collector 和应用共同删除 Authorization、Cookie、DSN、provider 原文、prompt/response/tool 参数；storage span 只允许 backend、operation、tenant hash、revision cohort、result、retry 和耗时等低基数属性。
+
 ### 10.1 最小可运行
 
 - 单 `platform` 进程 + mock 模型；InMemory coordination/session/memory/artifact；审计 stdout。
-- 可选 Redis coordination/Session/Memory 和 OTel Collector；若启动多个副本，三者必须全部切为 Redis，secret 通过环境变量注入。
+- 可选 Redis coordination/Memory、Redis 或 strict SQL Session，以及 OTel Collector；若启动多个副本，所有运行状态必须使用共享后端，secret 通过环境变量注入。
 - `/healthz`、`/readyz`、`/metrics` 和 Admin reload/rollback 可用。
 
-当前 `/readyz` 固定返回 ready，队列、Redis、模型和审计依赖不可用时也可能通过；仅可用于演示。单机模式不能通过加 LB 或 sticky session 获得持久高可用。
+`/readyz` 会在进程进入 drain、队列不可用、控制面未同步、内容安全/审计不可持久化，或生产配置中的 Session/Memory/Summary/Artifact/Knowledge 后端探测失败时返回 503；`/healthz` 只表示进程存活。受保护的依赖详情接口只返回低基数组件状态、epoch、延迟和稳定错误类别，探测同时刷新健康和 `queue_depth` 指标。local/demo 的按需展示租户后端作为可选 degraded 状态，不阻塞零依赖冒烟；production mode 对所有已配置必需后端 fail-closed。单机模式不能通过加 LB 或 sticky session 获得持久高可用。
 
 ### 10.2 生产推荐
 

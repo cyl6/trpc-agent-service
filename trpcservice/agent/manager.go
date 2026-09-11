@@ -7,33 +7,39 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/cyl6/trpc-agent-service/trpcservice/budget"
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
-	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
-	platformtool "github.com/cyl6/trpc-agent-service/trpcservice/tool"
+	"github.com/cyl6/trpc-agent-service/trpcservice/memoryvisibility"
+	"github.com/cyl6/trpc-agent-service/trpcservice/sessionturn"
+	platformskill "github.com/cyl6/trpc-agent-service/trpcservice/skill"
 
-	"golang.org/x/sync/singleflight"
-	"trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-	artifactinmemory "trpc.group/trpc-go/trpc-agent-go/artifact/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/artifact"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
-	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
-	memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
-	"trpc.group/trpc-go/trpc-agent-go/model"
-	modelopenai "trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
-	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
-	sessionredis "trpc.group/trpc-go/trpc-agent-go/session/redis"
-	"trpc.group/trpc-go/trpc-agent-go/tool"
+	agentskill "trpc.group/trpc-go/trpc-agent-go/skill"
 )
 
 type Runtime struct {
-	Runner       runner.Runner
-	AppNamespace string
-	Session      session.Service
-	Memory       memory.Service
+	Runner                  runner.Runner
+	AppNamespace            string
+	Session                 session.Service
+	TurnSession             sessionturn.TransactionalService
+	SessionDatabaseIdentity string
+	Memory                  memory.Service
+	MemoryReader            memory.Reader
+	MemoryIngestor          session.Ingestor
+	Artifact                artifact.Service
+	Knowledge               knowledge.Knowledge
+	backendClosers          []io.Closer
 }
 
 func (r *Runtime) close() error {
@@ -44,8 +50,10 @@ func (r *Runtime) close() error {
 	if r.Runner != nil {
 		err = errors.Join(err, r.Runner.Close())
 	}
-	if r.Memory != nil {
-		err = errors.Join(err, r.Memory.Close())
+	for _, closer := range r.backendClosers {
+		if closer != nil {
+			err = errors.Join(err, closer.Close())
+		}
 	}
 	if r.Session != nil {
 		err = errors.Join(err, r.Session.Close())
@@ -54,24 +62,66 @@ func (r *Runtime) close() error {
 }
 
 type handle struct {
-	runtime *Runtime
-	refs    int
+	runtime   *Runtime
+	refs      int
+	lastUsed  time.Time
+	evictable bool
 }
 
-// Manager caches immutable Runtimes by tenant, revision, and canonical config
-// digest. A singleflight build prevents duplicate connection pools without
-// holding the global cache mutex while a backend is contacted. Revisions are
-// retained for the process lifetime so delayed tasks can safely reuse the
-// exact Runtime they were enqueued with.
+const defaultRuntimeCacheLimit = 128
+
+// ErrRuntimeCapacity means all cache slots hold in-flight or process-local
+// state. Callers may retry after other work releases a persistent runtime.
+var ErrRuntimeCapacity = errors.New("runtime cache capacity exhausted")
+
+// Manager caches immutable Runtimes by tenant, revision, and config digest.
+// Capacity includes builds in progress. Only idle runtimes with durable state
+// can be evicted; process-local Session, Memory and Artifact data stay pinned.
+// Persisted task snapshots allow an evicted revision to be rebuilt on demand.
 type Manager struct {
-	mu      sync.Mutex
-	handles map[string]*handle
-	builds  singleflight.Group
-	closed  bool
+	mu         sync.Mutex
+	handles    map[string]*handle
+	builds     map[string]chan struct{}
+	cacheLimit int
+	build      func(context.Context, config.TenantConfig) (*Runtime, error)
+	closed     bool
 }
 
 func NewManager() *Manager {
-	return &Manager{handles: make(map[string]*handle)}
+	return NewManagerWithBudget(nil)
+}
+
+func NewManagerWithBudget(ledger budget.Ledger) *Manager {
+	return NewManagerWithBudgetAndVisibility(ledger, nil)
+}
+
+func NewManagerWithBudgetAndVisibility(ledger budget.Ledger, visibility memoryvisibility.Store) *Manager {
+	skills := NewSkillRepository(os.Getenv(platformskill.EnvSkillsRoot))
+	return &Manager{
+		handles:    make(map[string]*handle),
+		builds:     make(map[string]chan struct{}),
+		cacheLimit: defaultRuntimeCacheLimit,
+		build: func(ctx context.Context, tenant config.TenantConfig) (*Runtime, error) {
+			return buildRuntimeWithBudget(ctx, tenant, skills, ledger, visibility)
+		},
+	}
+}
+
+// NewSkillRepository resolves the platform skill repository rooted at root.
+// It returns nil (skills disabled) when root is empty or unreadable, so a
+// misconfigured repository never blocks tenant Runtime construction.
+func NewSkillRepository(root string) agentskill.Repository {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	repo, err := platformskill.Repository(root)
+	if err != nil {
+		// Repository errors may echo filesystem paths; keep the process log to
+		// a stable category.
+		log.Printf("skills disabled: repository init failed")
+		return nil
+	}
+	return repo
 }
 
 func (m *Manager) Acquire(ctx context.Context, tenant config.TenantConfig) (*Runtime, func(), error) {
@@ -79,62 +129,86 @@ func (m *Manager) Acquire(ctx context.Context, tenant config.TenantConfig) (*Run
 	if err != nil {
 		return nil, nil, err
 	}
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, nil, errors.New("runtime manager is closed")
-	}
-	if existing := m.handles[key]; existing != nil {
-		existing.refs++
-		m.mu.Unlock()
-		return existing.runtime, m.releaseFunc(existing), nil
-	}
-	m.mu.Unlock()
-
-	value, err, _ := m.builds.Do(key, func() (any, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		m.mu.Lock()
 		if m.closed {
 			m.mu.Unlock()
-			return nil, errors.New("runtime manager is closed")
+			return nil, nil, errors.New("runtime manager is closed")
 		}
 		if existing := m.handles[key]; existing != nil {
+			existing.refs++
+			existing.lastUsed = time.Now()
 			m.mu.Unlock()
-			return existing, nil
+			return existing.runtime, m.releaseFunc(existing), nil
 		}
+		if pending := m.builds[key]; pending != nil {
+			m.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-pending:
+				continue
+			}
+		}
+		var retired *Runtime
+		if len(m.handles)+len(m.builds) >= m.cacheLimit {
+			var oldest *handle
+			var oldestKey string
+			for candidateKey, candidate := range m.handles {
+				if candidate.refs == 0 && candidate.evictable && (oldest == nil || candidate.lastUsed.Before(oldest.lastUsed)) {
+					oldest, oldestKey = candidate, candidateKey
+				}
+			}
+			if oldest == nil {
+				m.mu.Unlock()
+				return nil, nil, ErrRuntimeCapacity
+			}
+			retired = oldest.runtime
+			delete(m.handles, oldestKey)
+		}
+		done := make(chan struct{})
+		m.builds[key] = done
 		m.mu.Unlock()
 
-		built, buildErr := buildRuntime(ctx, tenant)
+		// Closing and constructing backends must never hold the cache mutex.
+		// The reservation includes this close so replacement pools cannot exceed
+		// the cache limit while old resources are still being released.
+		if retired != nil {
+			_ = retired.close()
+		}
+		built, buildErr := m.build(ctx, tenant)
+		m.mu.Lock()
+		delete(m.builds, key)
+		close(done)
 		if buildErr != nil {
-			return nil, buildErr
+			m.mu.Unlock()
+			return nil, nil, buildErr
 		}
-		next := &handle{runtime: built}
-		m.mu.Lock()
-		if m.closed {
+		if m.closed || ctx.Err() != nil {
 			m.mu.Unlock()
 			_ = built.close()
-			return nil, errors.New("runtime manager is closed")
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			return nil, nil, errors.New("runtime manager is closed")
 		}
-		if existing := m.handles[key]; existing != nil {
-			m.mu.Unlock()
-			_ = built.close()
-			return existing, nil
-		}
-		m.handles[key] = next
+		h := &handle{runtime: built, refs: 1, lastUsed: time.Now(), evictable: runtimeStateIsDurable(tenant.Data)}
+		m.handles[key] = h
 		m.mu.Unlock()
-		return next, nil
-	})
-	if err != nil {
-		return nil, nil, err
+		return built, m.releaseFunc(h), nil
 	}
-	h := value.(*handle)
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, nil, errors.New("runtime manager is closed")
-	}
-	h.refs++
-	m.mu.Unlock()
-	return h.runtime, m.releaseFunc(h), nil
+}
+
+// runtimeStateIsDurable is intentionally conservative: an unknown or default
+// backend must never cause process-local user data to be silently discarded.
+func runtimeStateIsDurable(data config.DataConfig) bool {
+	return (data.Session.Type == "redis" || data.Session.Type == "sql") &&
+		(data.Memory.Type == "disabled" || data.Memory.Type == "redis" || data.Memory.Type == "external") &&
+		data.Artifact.Type == "object" &&
+		(data.Knowledge.Type == "" || data.Knowledge.Type == "disabled" || data.Knowledge.Type == "vector")
 }
 
 func (m *Manager) releaseFunc(h *handle) func() {
@@ -144,6 +218,7 @@ func (m *Manager) releaseFunc(h *handle) func() {
 			m.mu.Lock()
 			if h.refs > 0 {
 				h.refs--
+				h.lastUsed = time.Now()
 			}
 			m.mu.Unlock()
 		})
@@ -177,165 +252,4 @@ func runtimeCacheKey(tenant config.TenantConfig) (string, error) {
 	}
 	digest := sha256.Sum256(encoded)
 	return tenant.TenantID + "\x1f" + tenant.Version + "\x1f" + hex.EncodeToString(digest[:]), nil
-}
-
-func buildRuntime(_ context.Context, tenant config.TenantConfig) (*Runtime, error) {
-	appNamespace := domain.AppNamespace(tenant.TenantID, tenant.App.Name)
-	sessionService, err := buildSessionService(tenant, appNamespace)
-	if err != nil {
-		return nil, err
-	}
-	memoryService, err := buildMemoryService(tenant, appNamespace)
-	if err != nil {
-		_ = sessionService.Close()
-		return nil, err
-	}
-	artifactService := artifactinmemory.NewService()
-	tools := platformtool.BuiltInTools()
-	if memoryService != nil {
-		tools = append(tools, memoryService.Tools()...)
-	}
-	var rootAgent agent.Agent
-	switch tenant.Model.Provider {
-	case "mock":
-		rootAgent = &mockAgent{name: tenant.App.AgentName, description: tenant.App.Description, tools: tools}
-	case "openai":
-		apiKey, secretErr := config.Secret(tenant.Model.APIKeyEnv)
-		if secretErr != nil {
-			if memoryService != nil {
-				_ = memoryService.Close()
-			}
-			_ = sessionService.Close()
-			return nil, secretErr
-		}
-		modelOptions := []modelopenai.Option{modelopenai.WithAPIKey(apiKey)}
-		if tenant.Model.BaseURL != "" {
-			modelOptions = append(modelOptions, modelopenai.WithBaseURL(tenant.Model.BaseURL))
-		}
-		if tenant.Model.Variant != "" {
-			modelOptions = append(modelOptions, modelopenai.WithVariant(modelopenai.Variant(tenant.Model.Variant)))
-		}
-		llmModel := modelopenai.New(tenant.Model.Name, modelOptions...)
-		maxTokens := tenant.Model.MaxTokens
-		temperature := tenant.Model.Temperature
-		agentOptions := []llmagent.Option{
-			llmagent.WithModel(llmModel),
-			llmagent.WithDescription(tenant.App.Description),
-			llmagent.WithInstruction(tenant.App.Instruction),
-			llmagent.WithTools(tools),
-			llmagent.WithGenerationConfig(model.GenerationConfig{
-				MaxTokens: &maxTokens, Temperature: &temperature, Stream: tenant.Model.Streaming,
-			}),
-			llmagent.WithAddSessionSummary(true),
-			llmagent.WithMaxLLMCalls(8),
-			llmagent.WithMaxToolIterations(6),
-		}
-		if memoryService != nil {
-			agentOptions = append(agentOptions, llmagent.WithPreloadMemory(20))
-		}
-		rootAgent = llmagent.New(tenant.App.AgentName, agentOptions...)
-	default:
-		if memoryService != nil {
-			_ = memoryService.Close()
-		}
-		_ = sessionService.Close()
-		return nil, fmt.Errorf("unsupported model provider %q", tenant.Model.Provider)
-	}
-	runnerOptions := []runner.Option{runner.WithSessionService(sessionService), runner.WithArtifactService(artifactService)}
-	if memoryService != nil {
-		runnerOptions = append(runnerOptions, runner.WithMemoryService(memoryService))
-	}
-	r := runner.NewRunner(appNamespace, rootAgent, runnerOptions...)
-	return &Runtime{Runner: r, AppNamespace: appNamespace, Session: sessionService, Memory: memoryService}, nil
-}
-
-func buildMemoryService(tenant config.TenantConfig, appNamespace string) (memory.Service, error) {
-	memoryToolAllowed := func(name string) bool {
-		for _, denied := range tenant.Tools.Deny {
-			if denied == name {
-				return false
-			}
-		}
-		for _, allowed := range tenant.Tools.Allow {
-			if allowed == name {
-				return true
-			}
-		}
-		return false
-	}
-	memoryToolNames := []string{
-		memory.AddToolName, memory.UpdateToolName, memory.DeleteToolName,
-		memory.ClearToolName, memory.SearchToolName, memory.LoadToolName,
-	}
-	switch tenant.Data.Memory.Type {
-	case "disabled":
-		return nil, nil
-	case "inmemory":
-		options := make([]memoryinmemory.ServiceOpt, 0, len(memoryToolNames))
-		for _, name := range memoryToolNames {
-			options = append(options, memoryinmemory.WithToolEnabled(name, memoryToolAllowed(name)))
-		}
-		return memoryinmemory.NewMemoryService(options...), nil
-	case "redis":
-		rawURL, err := config.Secret(tenant.Data.Memory.DSNEnv)
-		if err != nil {
-			return nil, err
-		}
-		prefix := tenant.Data.Memory.Namespace
-		if prefix == "" {
-			prefix = appNamespace
-		}
-		options := []memoryredis.ServiceOpt{
-			memoryredis.WithRedisClientURL(rawURL),
-			memoryredis.WithKeyPrefix(prefix),
-		}
-		for _, name := range memoryToolNames {
-			options = append(options, memoryredis.WithToolEnabled(name, memoryToolAllowed(name)))
-		}
-		service, err := memoryredis.NewService(options...)
-		if err != nil {
-			return nil, errors.New("create redis memory service: invalid or unavailable backend")
-		}
-		return service, nil
-	default:
-		return nil, fmt.Errorf("unsupported runnable memory backend %q", tenant.Data.Memory.Type)
-	}
-}
-
-func buildSessionService(tenant config.TenantConfig, appNamespace string) (session.Service, error) {
-	switch tenant.Data.Session.Type {
-	case "inmemory":
-		return sessioninmemory.NewSessionService(), nil
-	case "redis":
-		rawURL, err := config.Secret(tenant.Data.Session.DSNEnv)
-		if err != nil {
-			return nil, err
-		}
-		prefix := tenant.Data.Session.Namespace
-		if prefix == "" {
-			prefix = appNamespace
-		}
-		service, err := sessionredis.NewService(
-			sessionredis.WithRedisClientURL(rawURL),
-			sessionredis.WithKeyPrefix(prefix),
-			sessionredis.WithEnableTracing(true),
-		)
-		if err != nil {
-			return nil, errors.New("create redis session service: invalid or unavailable backend")
-		}
-		return service, nil
-	default:
-		return nil, fmt.Errorf("unsupported runnable session backend %q", tenant.Data.Session.Type)
-	}
-}
-
-// ToolNames is used by diagnostics and tests without exposing tool instances.
-func ToolNames(tools []tool.Tool) []string {
-	names := make([]string, 0, len(tools))
-	for _, candidate := range tools {
-		if candidate != nil && candidate.Declaration() != nil {
-			names = append(names, candidate.Declaration().Name)
-		}
-	}
-	return names
 }

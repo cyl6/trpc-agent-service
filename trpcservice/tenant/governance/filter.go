@@ -1,31 +1,35 @@
 package governance
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cyl6/trpc-agent-service/trpcservice/budget"
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
+	"github.com/cyl6/trpc-agent-service/trpcservice/coordination"
 	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
 
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 var (
-	ErrUserDenied     = errors.New("IM user is not allowed for this tenant binding")
-	ErrInputTooLarge  = errors.New("message exceeds tenant input budget")
-	ErrRateLimited    = errors.New("tenant request rate exceeded")
-	ErrBudgetExceeded = errors.New("tenant monthly model budget exceeded")
-	approvalPattern   = regexp.MustCompile(`(?i)(?:^|\s)#approve:([a-f0-9-]{16,64})(?:\s|$)`)
+	ErrUserDenied             = errors.New("IM user is not allowed for this tenant binding")
+	ErrInputTooLarge          = errors.New("message exceeds tenant input budget")
+	ErrRateLimited            = errors.New("tenant request rate exceeded")
+	ErrRateLimiterUnavailable = coordination.ErrRateLimiterUnavailable
+	ErrBudgetExceeded         = budget.ErrBudgetExceeded
+	approvalPattern           = regexp.MustCompile(`(?i)(?:^|\s)#approve:([a-f0-9-]{16,64})(?:\s|$)`)
 )
 
 const (
@@ -42,8 +46,11 @@ type requestContextKey struct{}
 type RequestContext struct {
 	TenantID      string
 	ConfigVersion string
+	AppNamespace  string
 	UserID        string
 	SessionID     string
+	TurnID        string
+	DedupKey      string
 	SenderID      string
 	Channel       string
 	BindingID     string
@@ -63,30 +70,46 @@ func RequestContextFrom(ctx context.Context) (RequestContext, bool) {
 	return value, ok
 }
 
-type minuteBucket struct {
-	window int64
-	count  int
-}
-
 type costBucket struct {
 	month    string
 	reserved float64
 }
 
 // Filter performs inbound user authorization, message-size enforcement and a
-// tenant-level fixed-window budget before any model or storage call.
+// shared tenant fixed-window request check before any model or storage call.
+// The production constructor uses a persistent model-call ledger for monthly
+// budget admission; the legacy constructor keeps the old in-process estimate
+// for tests and explicitly local/demo deployments.
 type Filter struct {
-	mu      sync.Mutex
-	buckets map[string]minuteBucket
-	costs   map[string]costBucket
-	now     func() time.Time
+	mu           sync.Mutex
+	costs        map[string]costBucket
+	now          func() time.Time
+	rateLimiter  coordination.RateLimiter
+	legacyBudget bool
 }
 
 func NewFilter() *Filter {
-	return &Filter{buckets: make(map[string]minuteBucket), costs: make(map[string]costBucket), now: time.Now}
+	return &Filter{
+		costs: make(map[string]costBucket), now: time.Now,
+		rateLimiter: coordination.NewInMemory(), legacyBudget: true,
+	}
+}
+
+// NewFilterWithRateLimiter constructs the production path. Monthly budget
+// admission is performed per actual model call by the persistent ledger; the
+// filter only validates the message and consumes the shared request quota.
+func NewFilterWithRateLimiter(limiter coordination.RateLimiter) *Filter {
+	if limiter == nil {
+		limiter = coordination.NewInMemory()
+	}
+	return &Filter{costs: make(map[string]costBucket), now: time.Now, rateLimiter: limiter}
 }
 
 func (f *Filter) CheckInbound(tenant config.TenantConfig, binding config.ChannelConfig, msg domain.InboundMessage) error {
+	return f.CheckInboundContext(context.Background(), tenant, binding, msg)
+}
+
+func (f *Filter) CheckInboundContext(ctx context.Context, tenant config.TenantConfig, binding config.ChannelConfig, msg domain.InboundMessage) error {
 	if len(binding.AllowedUsers) > 0 && !contains(binding.AllowedUsers, msg.ExternalUserID) {
 		return ErrUserDenied
 	}
@@ -97,32 +120,32 @@ func (f *Filter) CheckInbound(tenant config.TenantConfig, binding config.Channel
 	if len([]rune(prompt)) > tenant.Budget.MaxInputChars {
 		return ErrInputTooLarge
 	}
+	if f.rateLimiter != nil {
+		allowed, _, err := f.rateLimiter.Allow(ctx, tenant.TenantID, tenant.Budget.RequestsPerMinute)
+		if err != nil {
+			return ErrRateLimiterUnavailable
+		}
+		if !allowed {
+			return ErrRateLimited
+		}
+	}
+	if !f.legacyBudget {
+		return nil
+	}
 	now := f.now().UTC()
-	minute := now.Unix() / 60
 	month := now.Format("2006-01")
 	estimatedCost := estimateMaxCost(tenant, prompt)
 	f.mu.Lock()
-	bucket := f.buckets[tenant.TenantID]
-	if bucket.window != minute {
-		bucket = minuteBucket{window: minute}
-	}
-	if bucket.count >= tenant.Budget.RequestsPerMinute {
-		f.mu.Unlock()
-		return ErrRateLimited
-	}
+	defer f.mu.Unlock()
 	cost := f.costs[tenant.TenantID]
 	if cost.month != month {
 		cost = costBucket{month: month}
 	}
 	if tenant.Budget.MonthlyCostUSD > 0 && cost.reserved+estimatedCost > tenant.Budget.MonthlyCostUSD {
-		f.mu.Unlock()
 		return ErrBudgetExceeded
 	}
-	bucket.count++
 	cost.reserved += estimatedCost
-	f.buckets[tenant.TenantID] = bucket
 	f.costs[tenant.TenantID] = cost
-	f.mu.Unlock()
 	return nil
 }
 
@@ -177,70 +200,6 @@ func ToolFilter(policy config.ToolPolicy) tool.FilterFunc {
 	}
 }
 
-type approval struct {
-	scope   string
-	expires time.Time
-}
-
-type ApprovalStore struct {
-	mu    sync.Mutex
-	items map[string]approval
-	now   func() time.Time
-}
-
-func NewApprovalStore() *ApprovalStore {
-	return &ApprovalStore{items: make(map[string]approval), now: time.Now}
-}
-
-func (s *ApprovalStore) Issue(scope string, ttl time.Duration) (string, error) {
-	for attempt := 0; attempt < 3; attempt++ {
-		random := make([]byte, 16)
-		if _, err := rand.Read(random); err != nil {
-			return "", errors.New("generate approval token")
-		}
-		nonce := hex.EncodeToString(random)
-		s.mu.Lock()
-		now := s.now()
-		s.deleteExpired(now)
-		if len(s.items) >= maxPendingApprovals {
-			s.mu.Unlock()
-			return "", errors.New("approval capacity reached")
-		}
-		if _, collision := s.items[nonce]; collision {
-			s.mu.Unlock()
-			continue
-		}
-		s.items[nonce] = approval{scope: scope, expires: now.Add(ttl)}
-		s.mu.Unlock()
-		return nonce, nil
-	}
-	return "", errors.New("generate unique approval token")
-}
-
-func (s *ApprovalStore) Consume(nonce, scope string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now()
-	s.deleteExpired(now)
-	if nonce == "" {
-		return false
-	}
-	item, ok := s.items[nonce]
-	if !ok || item.scope != scope {
-		return false
-	}
-	delete(s.items, nonce)
-	return true
-}
-
-func (s *ApprovalStore) deleteExpired(now time.Time) {
-	for nonce, item := range s.items {
-		if !now.Before(item.expires) {
-			delete(s.items, nonce)
-		}
-	}
-}
-
 type ToolDecision struct {
 	Request       RequestContext
 	ToolName      string
@@ -251,11 +210,11 @@ type ToolDecision struct {
 
 type ToolDecisionObserver func(context.Context, ToolDecision)
 
-func PermissionPolicy(policy config.ToolPolicy, approvals *ApprovalStore) tool.PermissionPolicyFunc {
+func PermissionPolicy(policy config.ToolPolicy, approvals ApprovalBackend) tool.PermissionPolicyFunc {
 	return PermissionPolicyObserved(policy, approvals, nil)
 }
 
-func PermissionPolicyObserved(policy config.ToolPolicy, approvals *ApprovalStore, observer ToolDecisionObserver) tool.PermissionPolicyFunc {
+func PermissionPolicyObserved(policy config.ToolPolicy, approvals ApprovalBackend, observer ToolDecisionObserver) tool.PermissionPolicyFunc {
 	allowed := stringSet(policy.Allow)
 	denied := stringSet(policy.Deny)
 	dangerous := stringSet(policy.RequireConfirm)
@@ -290,10 +249,14 @@ func PermissionPolicyObserved(policy config.ToolPolicy, approvals *ApprovalStore
 			return decide(tool.DenyPermission("approval context is unavailable"))
 		}
 		scope := approvalScope(rc, req.ToolName, req.Arguments)
-		if approvals.Consume(rc.ApprovalNonce, scope) {
+		approved, err := approvals.ConsumeApproval(ctx, rc.ApprovalNonce, scope)
+		if err != nil {
+			return decide(tool.DenyPermission("approval storage is temporarily unavailable"))
+		}
+		if approved {
 			return decide(tool.AllowPermission())
 		}
-		nonce, err := approvals.Issue(scope, 5*time.Minute)
+		nonce, err := approvals.IssueApproval(ctx, scope, 5*time.Minute)
 		if err != nil {
 			return decide(tool.DenyPermission("approval token is temporarily unavailable"))
 		}
@@ -304,16 +267,30 @@ func PermissionPolicyObserved(policy config.ToolPolicy, approvals *ApprovalStore
 func approvalScope(rc RequestContext, toolName string, args []byte) string {
 	normalized := normalizeJSON(args)
 	h := sha256.Sum256(normalized)
-	parts := []string{rc.TenantID, rc.ConfigVersion, rc.UserID, rc.SessionID, toolName, hex.EncodeToString(h[:])}
-	return strings.Join(parts, "\x1f")
+	parts := []string{rc.TenantID, rc.ConfigVersion, rc.AppNamespace, rc.UserID, rc.SenderID,
+		rc.SessionID, rc.Channel, rc.BindingID, toolName, hex.EncodeToString(h[:])}
+	// JSON encodes field boundaries unambiguously, even for custom callers
+	// supplying separator characters in a scope component.
+	encoded, _ := json.Marshal(parts)
+	return string(encoded)
 }
 
 func normalizeJSON(raw []byte) []byte {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var value any
-	if json.Unmarshal(raw, &value) == nil {
-		if encoded, err := json.Marshal(value); err == nil {
-			return encoded
-		}
+	if err := decoder.Decode(&value); err != nil {
+		return raw
+	}
+	// json.Decoder accepts a valid value followed by another valid value. The
+	// old json.Unmarshal-based behavior rejected that input, so preserve the
+	// fail-open-to-original-bytes behavior for every trailing token too.
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return raw
+	}
+	if encoded, err := json.Marshal(value); err == nil {
+		return encoded
 	}
 	return raw
 }

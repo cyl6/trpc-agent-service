@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
+	"github.com/cyl6/trpc-agent-service/trpcservice/delivery"
 	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
 )
 
@@ -28,7 +29,16 @@ type Adapter interface {
 	Name() string
 	Verify(r *http.Request, body []byte, binding config.ChannelConfig) error
 	Parse(body []byte, binding config.ChannelConfig) (ParsedWebhook, error)
-	Deliver(ctx context.Context, binding config.ChannelConfig, msg domain.OutboundMessage) error
+	// Plan deterministically splits one logical reply into provider-sized parts.
+	// It performs no I/O and does not read credentials, allowing callers to
+	// persist every part before attempting any external side effect.
+	Plan(binding config.ChannelConfig, msg domain.OutboundMessage) ([]delivery.Part, error)
+	// Deliver performs exactly one planned message operation. It must never
+	// loop over or implicitly split request.Message. Credential preflight is
+	// allowed, and an explicitly rejected authentication request may be
+	// replaced after refresh, but no request whose acceptance is uncertain may
+	// be repeated; operation-level retry belongs to the durable ledger.
+	Deliver(ctx context.Context, binding config.ChannelConfig, request delivery.Request) delivery.Result
 }
 
 // URLVerifier is implemented by adapters whose provider verifies the callback

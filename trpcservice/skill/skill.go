@@ -3,11 +3,25 @@
 package skill
 
 import (
+	"context"
 	"errors"
 	"os"
 
 	"trpc.group/trpc-go/trpc-agent-go/skill"
 )
+
+// VisibilityFilter snapshots a tenant's exact-name grants for the framework's
+// context-aware skill listing, loading and document tools. Empty denies all.
+func VisibilityFilter(names []string) skill.VisibilityFilter {
+	allowed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		allowed[name] = struct{}{}
+	}
+	return func(_ context.Context, summary skill.Summary) bool {
+		_, ok := allowed[summary.Name]
+		return ok
+	}
+}
 
 // EnvSkillsRoot is the environment variable pointing at the skills repository
 // root. It reuses the framework-wide variable so operators only configure it

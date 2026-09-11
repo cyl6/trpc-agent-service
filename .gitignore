@@ -1,6 +1,9 @@
 # build artifacts
 bin/
 coverage.out
+im-console/node_modules/
+im-console/dist/
+im-console/*.tsbuildinfo
 
 # local runtime state (keep directory placeholders)
 data/*

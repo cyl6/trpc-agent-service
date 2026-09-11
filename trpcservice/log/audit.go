@@ -1,6 +1,7 @@
 package log
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 )
 
 type Entry struct {
+	AuditID        string              `json:"audit_id,omitempty"`
 	Timestamp      time.Time           `json:"timestamp"`
 	TenantID       string              `json:"tenant_id"`
 	Channel        string              `json:"channel"`
@@ -35,12 +37,23 @@ type Entry struct {
 	ConfigRevision string              `json:"config_revision"`
 	ContentHash    string              `json:"content_hash,omitempty"`
 	ToolArgsHash   string              `json:"tool_args_hash,omitempty"`
+	OperationKey   string              `json:"operation_key,omitempty"`
+	OperationPhase string              `json:"operation_phase,omitempty"`
+	OperationState string              `json:"operation_state,omitempty"`
 	PolicySnapshot *config.AuditPolicy `json:"-"`
 	SecretEnvNames []string            `json:"-"`
 }
 
 type Sink interface {
 	Write(Entry) error
+}
+
+// ContextSink is an optional extension used by request paths that need the
+// audit storage span to remain attached to the caller's trace. Sink keeps its
+// historical context-free method so local/demo and embedding implementations
+// do not need a breaking API change.
+type ContextSink interface {
+	WriteContext(context.Context, Entry) error
 }
 
 type TenantPolicyProvider interface {
@@ -57,19 +70,31 @@ type Router struct {
 	files       map[string]*os.File
 	fileSinks   map[string]*JSONLines
 	stdoutSinks map[string]*JSONLines
+	sqlSink     *PostgresSink
 }
 
 func NewRouter(provider TenantPolicyProvider, stdout io.Writer, secretValues []string) *Router {
+	return NewRouterWithSQL(provider, stdout, secretValues, nil)
+}
+
+// NewRouterWithSQL adds the durable SQL sink while preserving the existing
+// stdout/file routing for tenants that have not opted into it.
+func NewRouterWithSQL(provider TenantPolicyProvider, stdout io.Writer, secretValues []string, sqlSink *PostgresSink) *Router {
 	if stdout == nil {
 		stdout = os.Stdout
 	}
 	return &Router{
 		provider: provider, stdout: stdout, secrets: append([]string(nil), secretValues...),
 		files: make(map[string]*os.File), fileSinks: make(map[string]*JSONLines), stdoutSinks: make(map[string]*JSONLines),
+		sqlSink: sqlSink,
 	}
 }
 
 func (r *Router) Write(entry Entry) error {
+	return r.WriteContext(context.Background(), entry)
+}
+
+func (r *Router) WriteContext(ctx context.Context, entry Entry) error {
 	if r == nil {
 		return nil
 	}
@@ -95,11 +120,12 @@ func (r *Router) Write(entry Entry) error {
 	}
 	secretValues := append([]string(nil), r.secrets...)
 	for _, envName := range entry.SecretEnvNames {
-		if value, ok := os.LookupEnv(envName); ok && value != "" {
+		if value, err := config.Secret(envName); err == nil && value != "" {
 			secretValues = append(secretValues, value)
 		}
 	}
 	redactor := NewRedactor(policy.RedactPatterns, secretValues)
+	entry.AuditID = StableAuditID(entry)
 	sinkKey := entry.TenantID + "\x1f" + revision
 	switch policy.Sink {
 	case "", "stdout":
@@ -110,7 +136,14 @@ func (r *Router) Write(entry Entry) error {
 			r.stdoutSinks[sinkKey] = sink
 		}
 		r.mu.Unlock()
-		return sink.Write(entry)
+		return sink.WriteWithRedactor(entry, redactor)
+	case "sql":
+		if r.sqlSink == nil {
+			return errors.New("audit sql sink is not configured")
+		}
+		entry.Reason = redactor.Clean(entry.Reason)
+		entry.ErrorType = redactor.Clean(entry.ErrorType)
+		return r.sqlSink.WriteContext(ctx, entry)
 	case "file":
 		if policy.Path == "" {
 			return errors.New("audit file sink requires a path")
@@ -128,7 +161,7 @@ func (r *Router) Write(entry Entry) error {
 			r.fileSinks[sinkKey] = sink
 		}
 		r.mu.Unlock()
-		return sink.Write(entry)
+		return sink.WriteWithRedactor(entry, redactor)
 	case "disabled":
 		return nil
 	default:
@@ -150,6 +183,9 @@ func (r *Router) Close() error {
 	}
 	r.files = nil
 	r.fileSinks = nil
+	if r.sqlSink != nil {
+		result = errors.Join(result, r.sqlSink.Close())
+	}
 	return result
 }
 
@@ -170,8 +206,19 @@ func NewJSONLines(w io.Writer, redactor *Redactor) *JSONLines {
 }
 
 func (s *JSONLines) Write(entry Entry) error {
-	entry.Reason = s.redactor.Clean(entry.Reason)
-	entry.ErrorType = s.redactor.Clean(entry.ErrorType)
+	return s.WriteWithRedactor(entry, s.redactor)
+}
+
+// WriteWithRedactor preserves the sink's write serialization while applying
+// the current request/revision secret set. This matters when a credential is
+// rotated without changing the tenant revision, and for console-provisioned
+// model keys that live in the in-process secret registry.
+func (s *JSONLines) WriteWithRedactor(entry Entry, redactor *Redactor) error {
+	if redactor == nil {
+		redactor = NewRedactor(nil, nil)
+	}
+	entry.Reason = redactor.Clean(entry.Reason)
+	entry.ErrorType = redactor.Clean(entry.ErrorType)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := json.NewEncoder(s.w).Encode(entry); err != nil {
@@ -221,4 +268,29 @@ func (r *Redactor) Clean(value string) string {
 func ContentHash(content string) string {
 	digest := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(digest[:])
+}
+
+// StableAuditID returns an identifier which is independent of delivery
+// attempts. Replay code should reuse Entry.AuditID when it has one; for older
+// callers this deterministic fallback keeps the same logical operation
+// idempotent without including the wall-clock timestamp.
+func StableAuditID(entry Entry) string {
+	if entry.AuditID != "" {
+		return entry.AuditID
+	}
+	seed := strings.Join([]string{
+		entry.TenantID, entry.RequestID, entry.OperationKey, entry.OperationPhase,
+		entry.SessionID, entry.UserID, entry.ToolName, entry.Decision,
+		entry.ContentHash, entry.ToolArgsHash,
+	}, "\x1f")
+	digest := sha256.Sum256([]byte(seed))
+	return "audit-" + hex.EncodeToString(digest[:16])
+}
+
+// StableOperationAuditID is used when a request can be replayed with a new
+// process/request UUID. The operation key is the durable identity; phase and
+// decision keep independent audit facts distinct.
+func StableOperationAuditID(tenantID, operationKey, phase, decision string) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{tenantID, operationKey, phase, decision}, "\x1f")))
+	return "audit-" + hex.EncodeToString(digest[:16])
 }

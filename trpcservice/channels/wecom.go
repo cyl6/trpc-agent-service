@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -14,7 +15,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
+	"github.com/cyl6/trpc-agent-service/trpcservice/delivery"
 	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
 )
 
@@ -49,6 +50,9 @@ type wecomTokenEntry struct {
 const (
 	wecomDefaultAPIBase = "https://qyapi.weixin.qq.com"
 	wecomMaxClockSkew   = 5 * time.Minute
+	// The WeCom wire protocol uses PKCS#7 with a 32-byte padding block even
+	// though AES-CBC itself has a 16-byte cipher block.
+	wecomPKCS7BlockSize = 32
 	// WeCom rejects text messages beyond 2048 UTF-8 bytes.
 	wecomDefaultMessageBytes = 2048
 )
@@ -118,6 +122,9 @@ func (c *wecomCipher) encrypt(msg, receiveID []byte) ([]byte, error) {
 		return nil, errors.New("invalid wecom cipher key")
 	}
 	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return nil, errors.New("generate wecom plaintext prefix failed")
+	}
 	plaintext := make([]byte, 0, 20+len(msg)+len(receiveID)+aes.BlockSize)
 	plaintext = append(plaintext, random...)
 	length := make([]byte, 4)
@@ -125,14 +132,14 @@ func (c *wecomCipher) encrypt(msg, receiveID []byte) ([]byte, error) {
 	plaintext = append(plaintext, length...)
 	plaintext = append(plaintext, msg...)
 	plaintext = append(plaintext, receiveID...)
-	padded := wecomPKCS7Pad(plaintext, aes.BlockSize)
+	padded := wecomPKCS7Pad(plaintext)
 	ciphertext := make([]byte, len(padded))
 	cipher.NewCBCEncrypter(block, c.key[:aes.BlockSize]).CryptBlocks(ciphertext, padded)
 	return ciphertext, nil
 }
 
-func wecomPKCS7Pad(data []byte, blockSize int) []byte {
-	padding := blockSize - len(data)%blockSize
+func wecomPKCS7Pad(data []byte) []byte {
+	padding := wecomPKCS7BlockSize - len(data)%wecomPKCS7BlockSize
 	return append(data, bytes.Repeat([]byte{byte(padding)}, padding)...)
 }
 
@@ -141,7 +148,7 @@ func wecomPKCS7Unpad(data []byte) ([]byte, error) {
 		return nil, errors.New("empty wecom plaintext")
 	}
 	padding := int(data[len(data)-1])
-	if padding == 0 || padding > len(data) || padding > aes.BlockSize {
+	if padding == 0 || padding > len(data) || padding > wecomPKCS7BlockSize {
 		return nil, errors.New("invalid wecom padding")
 	}
 	for _, b := range data[len(data)-padding:] {
@@ -245,7 +252,12 @@ type wecomMessage struct {
 	MsgID        int64  `xml:"MsgId"`
 	AgentID      int64  `xml:"AgentID"`
 	ChatID       string `xml:"ChatId"`
-	Image        *struct {
+	MediaID      string `xml:"MediaId"`
+	FileName     string `xml:"FileName"`
+	PicURL       string `xml:"PicUrl"`
+	// Retain compatibility with older nested fixtures while preferring the
+	// top-level MediaId fields emitted by the actual callback protocol.
+	Image *struct {
 		MediaID string `xml:"MediaId"`
 	} `xml:"Image"`
 	File *struct {
@@ -287,21 +299,31 @@ func (wc *WeCom) Parse(body []byte, binding config.ChannelConfig) (ParsedWebhook
 	}
 	// AgentID binding prevents cross-application routing when multiple apps
 	// share one corpid callback domain, mirroring the Slack app binding.
-	if m.AgentID != 0 && binding.ApplicationID != "" &&
-		strconv.FormatInt(m.AgentID, 10) != binding.ApplicationID {
-		return ParsedWebhook{}, ErrBindingMismatch
+	if binding.ApplicationID != "" {
+		if m.AgentID == 0 || strconv.FormatInt(m.AgentID, 10) != binding.ApplicationID {
+			return ParsedWebhook{}, ErrBindingMismatch
+		}
 	}
 	if m.MsgType == "event" || m.FromUserName == "" {
 		return ParsedWebhook{}, ErrUnsupportedEvent
 	}
 
 	attachments := make([]domain.Attachment, 0, 2)
-	if m.Image != nil && m.Image.MediaID != "" {
-		attachments = append(attachments, domain.Attachment{Type: "image", FileID: m.Image.MediaID})
+	mediaID := m.MediaID
+	if mediaID == "" && m.Image != nil {
+		mediaID = m.Image.MediaID
 	}
-	if m.File != nil && m.File.MediaID != "" {
+	fileName := m.FileName
+	if mediaID == "" && m.File != nil {
+		mediaID = m.File.MediaID
+		fileName = m.File.FileName
+	}
+	switch {
+	case m.MsgType == "image" && mediaID != "":
+		attachments = append(attachments, domain.Attachment{Type: "image", FileID: mediaID, URL: m.PicURL})
+	case m.MsgType == "file" && mediaID != "":
 		attachments = append(attachments, domain.Attachment{
-			Type: "file", FileID: m.File.MediaID, Name: m.File.FileName,
+			Type: "file", FileID: mediaID, Name: fileName,
 		})
 	}
 	if strings.TrimSpace(m.Content) == "" && len(attachments) == 0 {
@@ -346,17 +368,21 @@ type wecomTokenResponse struct {
 }
 
 type wecomSendResponse struct {
-	ErrCode int    `json:"errcode"`
-	ErrMsg  string `json:"errmsg"`
+	ErrCode int             `json:"errcode"`
+	ErrMsg  string          `json:"errmsg"`
+	MsgID   json.RawMessage `json:"msgid"`
 }
 
 // accessToken fetches and caches the app access token per (corpid, secret).
 // The token appears only in request URLs, so every error path returns a
 // category instead of the underlying URL-bearing failure.
-func (wc *WeCom) accessToken(ctx context.Context, binding config.ChannelConfig) (string, error) {
+func (wc *WeCom) accessToken(ctx context.Context, binding config.ChannelConfig) (string, delivery.Result) {
 	secret, err := config.Secret(binding.TokenEnv)
 	if err != nil {
-		return "", err
+		return "", delivery.Result{
+			Outcome: delivery.PermanentRejected, ErrorType: "provider_auth",
+			Err: errors.New("load wecom token secret failed"),
+		}
 	}
 	cacheKey := binding.WorkspaceID + "\x1f" + binding.TokenEnv
 	wc.mu.Lock()
@@ -364,7 +390,7 @@ func (wc *WeCom) accessToken(ctx context.Context, binding config.ChannelConfig) 
 	if ok && wc.now().Before(cached.expiresAt) {
 		token := cached.accessToken
 		wc.mu.Unlock()
-		return token, nil
+		return token, delivery.Result{Outcome: delivery.Confirmed}
 	}
 	wc.mu.Unlock()
 
@@ -378,20 +404,49 @@ func (wc *WeCom) accessToken(ctx context.Context, binding config.ChannelConfig) 
 	}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", errors.New("create wecom token request failed")
+		return "", delivery.Result{
+			Outcome: delivery.PermanentRejected, ErrorType: "request_invalid",
+			Err: errors.New("create wecom token request failed"),
+		}
 	}
 	resp, err := wc.client.Do(req)
 	if err != nil {
-		return "", errors.New("wecom token request failed")
+		return "", delivery.Result{
+			Outcome: delivery.RetryableNotSent, ErrorType: "token_transport",
+			Err: errors.New("wecom token request failed"),
+		}
 	}
-	defer resp.Body.Close()
-	limited := io.LimitReader(resp.Body, 1<<20)
+	exchange := readHTTPResponse(resp)
+	classified, terminal := classifyHTTP(exchange, wc.now(), "X-Request-Id")
+	if terminal {
+		// No message request has been made yet. Even a truncated token response
+		// is safe to retry rather than operation-unknown.
+		if classified.Outcome == delivery.Unknown {
+			classified.Outcome = delivery.RetryableNotSent
+			classified.ErrorType = "token_transport"
+		}
+		return "", classified
+	}
 	var tokenResp wecomTokenResponse
-	if err := json.NewDecoder(limited).Decode(&tokenResp); err != nil {
-		return "", errors.New("decode wecom token response failed")
+	if err := decodeJSONResponse(exchange, &tokenResp); err != nil {
+		result := responseMetadata(exchange, "X-Request-Id")
+		result.Outcome = delivery.RetryableNotSent
+		result.ErrorType = "token_response_invalid"
+		result.Err = errors.New("decode wecom token response failed")
+		return "", result
 	}
 	if tokenResp.ErrCode != 0 || tokenResp.AccessToken == "" {
-		return "", fmt.Errorf("wecom token rejected: errcode %d", tokenResp.ErrCode)
+		result := responseMetadata(exchange, "X-Request-Id")
+		result.ProviderCode = strconv.Itoa(tokenResp.ErrCode)
+		if wecomTransientCode(tokenResp.ErrCode) || (tokenResp.ErrCode == 0 && tokenResp.AccessToken == "") {
+			result.Outcome = delivery.RetryableNotSent
+			result.ErrorType = "token_transient"
+			result.RetryAfter = parseRetryAfter(exchange.header.Get("Retry-After"), wc.now())
+		} else {
+			result.Outcome = delivery.PermanentRejected
+			result.ErrorType = "provider_auth"
+		}
+		return "", result
 	}
 	expiresIn := time.Duration(tokenResp.ExpiresIn) * time.Second
 	if expiresIn <= 0 {
@@ -408,7 +463,7 @@ func (wc *WeCom) accessToken(ctx context.Context, binding config.ChannelConfig) 
 		expiresAt:   wc.now().Add(usable),
 	}
 	wc.mu.Unlock()
-	return tokenResp.AccessToken, nil
+	return tokenResp.AccessToken, delivery.Result{Outcome: delivery.Confirmed}
 }
 
 func (wc *WeCom) invalidateToken(binding config.ChannelConfig) {
@@ -418,31 +473,80 @@ func (wc *WeCom) invalidateToken(binding config.ChannelConfig) {
 	wc.mu.Unlock()
 }
 
-func (wc *WeCom) sendOnce(ctx context.Context, binding config.ChannelConfig, token, path string, payload map[string]any) error {
+func (wc *WeCom) sendOnce(ctx context.Context, binding config.ChannelConfig, token, path string, payload map[string]any) delivery.Result {
 	base := strings.TrimRight(binding.APIBaseURL, "/")
 	if base == "" {
 		base = wecomDefaultAPIBase
 	}
 	endpoint := base + path + "?access_token=" + url.QueryEscape(token)
 	var response wecomSendResponse
-	if err := postJSON(ctx, wc.client, endpoint, nil, payload, &response); err != nil {
-		return err
+	exchange := postJSON(ctx, wc.client, endpoint, nil, payload)
+	classified, terminal := classifyHTTP(exchange, wc.now(), "X-Request-Id")
+	decodeErr := decodeJSONResponse(exchange, &response)
+	if terminal {
+		if decodeErr == nil && response.ErrCode != 0 {
+			classified.ProviderCode = strconv.Itoa(response.ErrCode)
+			if response.ErrCode == 40014 || response.ErrCode == 42001 {
+				classified.Outcome = delivery.RetryableNotSent
+				classified.ErrorType = "provider_auth_expired"
+			} else if wecomTransientCode(response.ErrCode) {
+				classified.Outcome = delivery.RetryableNotSent
+				classified.ErrorType = "provider_transient"
+			}
+		}
+		return classified
 	}
+	if decodeErr != nil {
+		return malformedSuccess(exchange, "X-Request-Id")
+	}
+	result := responseMetadata(exchange, "X-Request-Id")
+	result.ProviderCode = strconv.Itoa(response.ErrCode)
 	if response.ErrCode == 40014 || response.ErrCode == 42001 {
-		return fmt.Errorf("wecom delivery token expired: errcode %d", response.ErrCode)
+		result.Outcome = delivery.RetryableNotSent
+		result.ErrorType = "provider_auth_expired"
+		return result
 	}
 	if response.ErrCode != 0 {
-		return fmt.Errorf("wecom delivery rejected: errcode %d %s", response.ErrCode, response.ErrMsg)
+		if wecomTransientCode(response.ErrCode) {
+			result.Outcome = delivery.RetryableNotSent
+			result.ErrorType = "provider_transient"
+			result.RetryAfter = parseRetryAfter(exchange.header.Get("Retry-After"), wc.now())
+		} else {
+			result.Outcome = delivery.PermanentRejected
+			result.ErrorType = "provider_rejected"
+		}
+		return result
 	}
-	return nil
+	result.Outcome = delivery.Confirmed
+	result.ProviderCode = ""
+	result.ProviderMessageID = jsonIdentifier(response.MsgID)
+	return result
 }
 
-func (wc *WeCom) Deliver(ctx context.Context, binding config.ChannelConfig, msg domain.OutboundMessage) error {
+func (*WeCom) Plan(binding config.ChannelConfig, msg domain.OutboundMessage) ([]delivery.Part, error) {
+	pieces, err := chunksUTF8Bytes(msg.Text, binding.MaxMessageLength)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]delivery.Part, 0, len(pieces))
+	for index, text := range pieces {
+		partMessage := cloneOutbound(msg)
+		partMessage.Text = text
+		parts = append(parts, delivery.Part{Message: partMessage, Index: index, Total: len(pieces)})
+	}
+	return parts, nil
+}
+
+func (wc *WeCom) Deliver(ctx context.Context, binding config.ChannelConfig, request delivery.Request) delivery.Result {
+	msg := request.Message
 	agentID := int64(0)
 	if binding.ApplicationID != "" {
 		parsed, err := strconv.ParseInt(binding.ApplicationID, 10, 64)
 		if err != nil {
-			return errors.New("invalid wecom agentid configuration")
+			return delivery.Result{
+				Outcome: delivery.PermanentRejected, ErrorType: "request_invalid",
+				Err: errors.New("invalid wecom agentid configuration"),
+			}
 		}
 		agentID = parsed
 	}
@@ -452,68 +556,88 @@ func (wc *WeCom) Deliver(ctx context.Context, binding config.ChannelConfig, msg 
 	if msg.Scope == domain.ScopeGroup {
 		path = "/cgi-bin/appchat/send"
 	}
-	for _, part := range chunksUTF8Bytes(msg.Text, binding.MaxMessageLength) {
-		payload := map[string]any{
-			"msgtype":                  "text",
-			"text":                     map[string]any{"content": part},
-			"duplicate_check_interval": 1800,
-		}
-		if msg.Scope == domain.ScopeGroup {
-			payload["chatid"] = msg.Target
-		} else {
-			payload["touser"] = msg.Target
-			payload["agentid"] = agentID
-		}
-		token, err := wc.accessToken(ctx, binding)
-		if err != nil {
-			return err
-		}
-		if err := wc.sendOnce(ctx, binding, token, path, payload); err != nil {
-			if strings.Contains(err.Error(), "token expired") {
-				// Token rotated or expired early: refresh once and retry the part.
-				wc.invalidateToken(binding)
-				token, err = wc.accessToken(ctx, binding)
-				if err != nil {
-					return err
-				}
-				if err := wc.sendOnce(ctx, binding, token, path, payload); err != nil {
-					return err
-				}
-				continue
-			}
-			return err
-		}
+	payload := map[string]any{
+		"msgtype": "text",
+		"text":    map[string]any{"content": msg.Text},
 	}
-	return nil
+	if msg.Scope == domain.ScopeGroup {
+		payload["chatid"] = msg.Target
+	} else {
+		payload["touser"] = msg.Target
+		payload["agentid"] = agentID
+	}
+	token, tokenResult := wc.accessToken(ctx, binding)
+	if token == "" {
+		return tokenResult
+	}
+	result := wc.sendOnce(ctx, binding, token, path, payload)
+	if result.ErrorType != "provider_auth_expired" {
+		return result
+	}
+	// The provider explicitly rejected the first request before sending because
+	// its token was stale. Refreshing and retrying this same part once is safe.
+	wc.invalidateToken(binding)
+	token, tokenResult = wc.accessToken(ctx, binding)
+	if token == "" {
+		return tokenResult
+	}
+	return wc.sendOnce(ctx, binding, token, path, payload)
 }
 
 // chunksUTF8Bytes splits text into parts of at most limit bytes without
 // cutting a multi-byte rune; WeCom's content limit is expressed in bytes.
-func chunksUTF8Bytes(text string, limit int) []string {
+func chunksUTF8Bytes(text string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = wecomDefaultMessageBytes
 	}
+	if !utf8.ValidString(text) {
+		return nil, errors.New("wecom text is not valid UTF-8")
+	}
 	if len(text) <= limit {
 		if len(text) == 0 {
-			return []string{""}
+			return []string{""}, nil
 		}
-		return []string{text}
+		return []string{text}, nil
 	}
 	result := make([]string, 0, (len(text)+limit-1)/limit)
 	for len(text) > 0 {
-		n := limit
-		if n > len(text) {
-			n = len(text)
-		}
-		for n < len(text) && !utf8.RuneStart(text[n]) {
-			n--
+		n := 0
+		for _, r := range text {
+			width := utf8.RuneLen(r)
+			if n+width > limit {
+				break
+			}
+			n += width
 		}
 		if n == 0 {
-			// A single rune wider than the limit cannot be split safely.
-			n = limit
+			return nil, fmt.Errorf("wecom message byte limit %d is smaller than one UTF-8 code point", limit)
 		}
 		result = append(result, text[:n])
 		text = text[n:]
 	}
-	return result
+	return result, nil
+}
+
+func wecomTransientCode(code int) bool {
+	switch code {
+	case -1, 45009:
+		return true
+	default:
+		return false
+	}
+}
+
+func jsonIdentifier(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	if raw[0] == '"' {
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return ""
+		}
+		return sanitizeIdentifier(value, 160)
+	}
+	return sanitizeIdentifier(string(raw), 160)
 }

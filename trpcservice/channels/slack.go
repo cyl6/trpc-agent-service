@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
+	"github.com/cyl6/trpc-agent-service/trpcservice/delivery"
 	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
 )
 
@@ -124,10 +125,28 @@ func (*Slack) Parse(body []byte, binding config.ChannelConfig) (ParsedWebhook, e
 	}}}, nil
 }
 
-func (s *Slack) Deliver(ctx context.Context, binding config.ChannelConfig, msg domain.OutboundMessage) error {
+func (*Slack) Plan(binding config.ChannelConfig, msg domain.OutboundMessage) ([]delivery.Part, error) {
+	limit := binding.MaxMessageLength
+	if limit <= 0 {
+		limit = 4000
+	}
+	return planRuneParts(msg, limit), nil
+}
+
+type slackSendResponse struct {
+	OK      bool   `json:"ok"`
+	Error   string `json:"error"`
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
+}
+
+func (s *Slack) Deliver(ctx context.Context, binding config.ChannelConfig, request delivery.Request) delivery.Result {
 	token, err := config.Secret(binding.TokenEnv)
 	if err != nil {
-		return err
+		return delivery.Result{
+			Outcome: delivery.PermanentRejected, ErrorType: "provider_auth",
+			Err: fmt.Errorf("load slack token failed"),
+		}
 	}
 	url := strings.TrimRight(binding.APIBaseURL, "/")
 	if url == "" {
@@ -135,21 +154,53 @@ func (s *Slack) Deliver(ctx context.Context, binding config.ChannelConfig, msg d
 	} else {
 		url += "/chat.postMessage"
 	}
-	for _, part := range chunks(msg.Text, binding.MaxMessageLength) {
-		payload := map[string]any{"channel": msg.Target, "text": part}
-		if msg.ThreadID != "" {
-			payload["thread_ts"] = msg.ThreadID
-		}
-		var response struct {
-			OK    bool   `json:"ok"`
-			Error string `json:"error"`
-		}
-		if err := postJSON(ctx, s.client, url, map[string]string{"Authorization": "Bearer " + token}, payload, &response); err != nil {
-			return err
-		}
-		if !response.OK {
-			return fmt.Errorf("slack delivery rejected: %s", response.Error)
-		}
+	msg := request.Message
+	payload := map[string]any{"channel": msg.Target, "text": msg.Text}
+	if msg.ThreadID != "" {
+		payload["thread_ts"] = msg.ThreadID
 	}
-	return nil
+	exchange := postJSON(ctx, s.client, url, map[string]string{"Authorization": "Bearer " + token}, payload)
+	classified, terminal := classifyHTTP(exchange, s.now(), "X-Slack-Req-Id", "X-Request-Id")
+	var response slackSendResponse
+	decodeErr := decodeJSONResponse(exchange, &response)
+	if terminal {
+		if decodeErr == nil {
+			if code := sanitizeIdentifier(response.Error, 96); code != "" {
+				classified.ProviderCode = code
+			}
+			if !response.OK && slackTransientError(response.Error) {
+				classified.Outcome = delivery.RetryableNotSent
+				classified.ErrorType = "provider_transient"
+			}
+		}
+		return classified
+	}
+	if decodeErr != nil {
+		return malformedSuccess(exchange, "X-Slack-Req-Id", "X-Request-Id")
+	}
+	result := responseMetadata(exchange, "X-Slack-Req-Id", "X-Request-Id")
+	if response.OK {
+		result.Outcome = delivery.Confirmed
+		result.ProviderMessageID = sanitizeIdentifier(response.TS, 96)
+		return result
+	}
+	result.ProviderCode = sanitizeIdentifier(response.Error, 96)
+	if slackTransientError(response.Error) {
+		result.Outcome = delivery.RetryableNotSent
+		result.ErrorType = "provider_transient"
+		result.RetryAfter = parseRetryAfter(exchange.header.Get("Retry-After"), s.now())
+	} else {
+		result.Outcome = delivery.PermanentRejected
+		result.ErrorType = "provider_rejected"
+	}
+	return result
+}
+
+func slackTransientError(code string) bool {
+	switch code {
+	case "ratelimited", "internal_error", "fatal_error", "service_unavailable", "temporarily_unavailable", "request_timeout":
+		return true
+	default:
+		return false
+	}
 }

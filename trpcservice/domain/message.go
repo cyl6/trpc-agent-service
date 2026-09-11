@@ -59,8 +59,18 @@ type OutboundMessage struct {
 func Identity(msg InboundMessage, appName string) (userID, sessionID string) {
 	conversation := msg.ConversationID
 	if msg.Scope == ScopeDirect {
-		conversation = msg.ExternalUserID
 		userID = digest("user", msg.TenantID, msg.BindingID, msg.Channel, msg.ExternalUserID)
+		// Real IM direct messages are one ongoing conversation per provider user,
+		// even when a provider changes its opaque chat id. The admin API is
+		// different: its console exposes explicit, user-created conversations and
+		// must honor conversation_id so two "new conversations" do not silently
+		// share model context. Include the simulated user as well so callers cannot
+		// collide by choosing the same conversation id.
+		if msg.Channel == "api" && msg.ConversationID != "" {
+			conversation = msg.ExternalUserID + "\x1f" + msg.ConversationID
+		} else {
+			conversation = msg.ExternalUserID
+		}
 	} else {
 		// Runner keys include UserID. A group principal keeps all members of the
 		// same group on one transcript while the sender remains available in the
@@ -70,6 +80,14 @@ func Identity(msg InboundMessage, appName string) (userID, sessionID string) {
 	sessionID = digest("session", msg.TenantID, appName, msg.BindingID, msg.Channel,
 		string(msg.Scope), conversation, msg.ThreadID)
 	return userID, sessionID
+}
+
+// SessionPartitionKey is the single FIFO lane shared by durable dispatch and
+// the Worker session lock. Keeping it beside Identity prevents queue ordering
+// from drifting away from transcript isolation when identity rules evolve.
+func SessionPartitionKey(msg InboundMessage, appName string) string {
+	principalID, sessionID := Identity(msg, appName)
+	return AppNamespace(msg.TenantID, appName) + ":" + principalID + ":" + sessionID
 }
 
 // AppNamespace returns a stable opaque namespace accepted by tRPC-Agent's

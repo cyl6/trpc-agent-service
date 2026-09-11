@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
+	"github.com/cyl6/trpc-agent-service/trpcservice/delivery"
 	"github.com/cyl6/trpc-agent-service/trpcservice/worker"
 )
 
@@ -20,6 +21,13 @@ var (
 
 type Dispatcher interface {
 	Submit(context.Context, worker.Task) error
+}
+
+// ReadinessProbe is implemented by dispatchers that can verify whether they
+// can currently accept work. The HTTP readiness endpoint uses it without
+// expanding the basic Dispatcher contract used by tests and integrations.
+type ReadinessProbe interface {
+	Ready(context.Context) error
 }
 
 type Processor interface {
@@ -66,6 +74,18 @@ func (q *InProcess) Submit(ctx context.Context, task worker.Task) error {
 	}
 }
 
+func (q *InProcess) Ready(context.Context) error {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.closed {
+		return ErrClosed
+	}
+	if len(q.tasks) >= cap(q.tasks) {
+		return ErrFull
+	}
+	return nil
+}
+
 func (q *InProcess) consume() {
 	defer q.wg.Done()
 	for task := range q.tasks {
@@ -77,6 +97,14 @@ func (q *InProcess) consume() {
 		for attempt := 0; attempt < 3; attempt++ {
 			if _, err = q.processor.Process(ctx, task); err == nil {
 				break
+			}
+			var deliveryFailure *delivery.FailureError
+			if errors.As(err, &deliveryFailure) {
+				if deliveryFailure.Outcome != delivery.RetryableNotSent || !deliveryFailure.RetryWholeTask {
+					// Unknown may already have produced a provider side effect, while
+					// a later-part failure cannot replay already confirmed parts.
+					break
+				}
 			}
 			if attempt < 2 {
 				time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)

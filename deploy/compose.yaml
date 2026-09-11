@@ -1,9 +1,86 @@
 name: trpc-agent-service
 
 services:
-  # Keep one service process in the runnable baseline. Scaling requires a
-  # durable inbox plus shared approval, budget and config-control stores.
-  # Session, Memory and message coordination are already Redis-backed.
+  # Ensure the least-privilege login exists even when an older named volume is
+  # reused (docker-entrypoint-initdb.d only runs for a fresh cluster).
+  runtime-role:
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "/bootstrap/000_runtime_role.sh"]
+    environment:
+      PGHOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-tenant_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-local-development-password}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-runtime}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-local-runtime-password}
+    volumes:
+      - ./postgres-init/000_runtime_role.sh:/bootstrap/000_runtime_role.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  # One-shot schema owner. Production should inject this DSN from a migration
+  # secret that is not mounted into the long-running service container.
+  migrator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: trpc-agent-service:local
+    entrypoint: ["/usr/local/bin/trpc-migrate"]
+    command: ["-dsn-env", "TRPC_AGENT_MIGRATION_DSN", "-config", "/etc/trpc-agent-service/config.yaml", "-timeout", "2m"]
+    environment:
+      TRPC_AGENT_MIGRATION_DSN: postgres://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-local-development-password}@postgres:5432/${POSTGRES_DB:-tenant_agent}?sslmode=disable
+    volumes:
+      - ./service-config.yaml:/etc/trpc-agent-service/config.yaml:ro
+    depends_on:
+      runtime-role:
+        condition: service_completed_successfully
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+
+  # Migrations create new data-plane objects after the role bootstrap. Re-run
+  # the idempotent grant step so the service account receives only those
+  # explicitly allowlisted objects, including when a named volume is reused.
+  runtime-grants:
+    image: postgres:16-alpine
+    entrypoint: ["/bin/sh", "/bootstrap/000_runtime_role.sh"]
+    environment:
+      PGHOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-tenant_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-local-development-password}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-runtime}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-local-runtime-password}
+    volumes:
+      - ./postgres-init/000_runtime_role.sh:/bootstrap/000_runtime_role.sh:ro
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  # The service runs the durable Inbox/Outbox pipeline on Postgres, so it can
+  # be scaled to multiple replicas: leases (SELECT ... FOR UPDATE SKIP LOCKED)
+  # fence concurrent workers and replies survive restarts. The ACME tenant
+  # uses the strict PostgreSQL Session turn backend; Globex keeps Redis Session
+  # to demonstrate tenant-level backend routing. Memory and coordination remain
+  # Redis-backed.
   service:
     build:
       context: ..
@@ -13,7 +90,10 @@ services:
     init: true
     environment:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-local-development-admin-token}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       REDIS_URL: redis://redis:6379/0
+      TRPC_AGENT_DB_DSN: postgres://${POSTGRES_RUNTIME_USER:-runtime}:${POSTGRES_RUNTIME_PASSWORD:-local-runtime-password}@postgres:5432/${POSTGRES_DB:-tenant_agent}?sslmode=disable
+      TRPC_CONFIG_NODE_ID: ${TRPC_CONFIG_NODE_ID:-trpc-service-local}
       ACME_TELEGRAM_BOT_TOKEN: ${ACME_TELEGRAM_BOT_TOKEN:-unused-local-token}
       ACME_TELEGRAM_WEBHOOK_SECRET: ${ACME_TELEGRAM_WEBHOOK_SECRET:-local-development-webhook-secret}
       ACME_SLACK_BOT_TOKEN: ${ACME_SLACK_BOT_TOKEN:-unused-local-token}
@@ -21,6 +101,8 @@ services:
       ACME_WECOM_CORP_SECRET: ${ACME_WECOM_CORP_SECRET:-unused-local-token}
       ACME_WECOM_CALLBACK_TOKEN: ${ACME_WECOM_CALLBACK_TOKEN:-local-development-callback-token}
       ACME_WECOM_ENCODING_AES_KEY: ${ACME_WECOM_ENCODING_AES_KEY:-}
+      ACME_WECOM_AIBOT_ID: ${ACME_WECOM_AIBOT_ID:-}
+      ACME_WECOM_AIBOT_SECRET: ${ACME_WECOM_AIBOT_SECRET:-}
       GLOBEX_TELEGRAM_BOT_TOKEN: ${GLOBEX_TELEGRAM_BOT_TOKEN:-unused-local-token}
       GLOBEX_TELEGRAM_WEBHOOK_SECRET: ${GLOBEX_TELEGRAM_WEBHOOK_SECRET:-local-development-webhook-secret}
     ports:
@@ -32,6 +114,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      runtime-grants:
+        condition: service_completed_successfully
       otel-collector:
         condition: service_started
     healthcheck:
@@ -84,11 +168,14 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-tenant_agent}
       POSTGRES_USER: ${POSTGRES_USER:-platform}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-password}
+      POSTGRES_RUNTIME_USER: ${POSTGRES_RUNTIME_USER:-runtime}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:-local-runtime-password}
       POSTGRES_INITDB_ARGS: --data-checksums
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init/000_runtime_role.sh:/docker-entrypoint-initdb.d/000_runtime_role.sh:ro
       - ../migrations/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]

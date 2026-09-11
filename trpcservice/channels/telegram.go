@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cyl6/trpc-agent-service/trpcservice/config"
+	"github.com/cyl6/trpc-agent-service/trpcservice/delivery"
 	"github.com/cyl6/trpc-agent-service/trpcservice/domain"
 )
 
@@ -117,10 +119,33 @@ func (*Telegram) Parse(body []byte, binding config.ChannelConfig) (ParsedWebhook
 	}}}, nil
 }
 
-func (t *Telegram) Deliver(ctx context.Context, binding config.ChannelConfig, msg domain.OutboundMessage) error {
+func (*Telegram) Plan(binding config.ChannelConfig, msg domain.OutboundMessage) ([]delivery.Part, error) {
+	limit := binding.MaxMessageLength
+	if limit <= 0 {
+		limit = 4096
+	}
+	return planRuneParts(msg, limit), nil
+}
+
+type telegramSendResponse struct {
+	OK          bool   `json:"ok"`
+	ErrorCode   int    `json:"error_code"`
+	Description string `json:"description"`
+	Parameters  struct {
+		RetryAfter int64 `json:"retry_after"`
+	} `json:"parameters"`
+	Result struct {
+		MessageID int64 `json:"message_id"`
+	} `json:"result"`
+}
+
+func (t *Telegram) Deliver(ctx context.Context, binding config.ChannelConfig, request delivery.Request) delivery.Result {
 	token, err := config.Secret(binding.TokenEnv)
 	if err != nil {
-		return err
+		return delivery.Result{
+			Outcome: delivery.PermanentRejected, ErrorType: "provider_auth",
+			Err: errors.New("load telegram token failed"),
+		}
 	}
 	base := strings.TrimRight(binding.APIBaseURL, "/")
 	if base == "" {
@@ -128,21 +153,54 @@ func (t *Telegram) Deliver(ctx context.Context, binding config.ChannelConfig, ms
 	}
 	// The token is used only in the request URL and is never included in an error.
 	url := base + "/bot" + token + "/sendMessage"
-	for _, part := range chunks(msg.Text, binding.MaxMessageLength) {
-		var response struct {
-			OK          bool   `json:"ok"`
-			Description string `json:"description"`
-		}
-		payload := map[string]any{"chat_id": msg.Target, "text": part}
-		if threadID, parseErr := strconv.ParseInt(msg.ThreadID, 10, 64); parseErr == nil && threadID != 0 {
-			payload["message_thread_id"] = threadID
-		}
-		if err := postJSON(ctx, t.client, url, nil, payload, &response); err != nil {
-			return err
-		}
-		if !response.OK {
-			return fmt.Errorf("telegram delivery rejected: %s", response.Description)
-		}
+	msg := request.Message
+	payload := map[string]any{"chat_id": msg.Target, "text": msg.Text}
+	if threadID, parseErr := strconv.ParseInt(msg.ThreadID, 10, 64); parseErr == nil && threadID != 0 {
+		payload["message_thread_id"] = threadID
 	}
-	return nil
+	exchange := postJSON(ctx, t.client, url, nil, payload)
+	classified, terminal := classifyHTTP(exchange, time.Now(), "X-Request-Id")
+	var response telegramSendResponse
+	decodeErr := decodeJSONResponse(exchange, &response)
+	if terminal {
+		// A structured provider rejection can carry a more useful stable code and
+		// retry delay even when the HTTP status already determines the outcome.
+		if decodeErr == nil {
+			if response.ErrorCode != 0 {
+				classified.ProviderCode = strconv.Itoa(response.ErrorCode)
+			}
+			if response.Parameters.RetryAfter > 0 {
+				classified.RetryAfter = largerDelay(classified.RetryAfter, secondsDuration(response.Parameters.RetryAfter))
+			}
+			if !response.OK && (response.ErrorCode == http.StatusTooManyRequests || response.ErrorCode >= 500) {
+				classified.Outcome = delivery.RetryableNotSent
+				classified.ErrorType = "provider_transient"
+			}
+		}
+		return classified
+	}
+	if decodeErr != nil {
+		return malformedSuccess(exchange, "X-Request-Id")
+	}
+	result := responseMetadata(exchange, "X-Request-Id")
+	if response.OK {
+		result.Outcome = delivery.Confirmed
+		if response.Result.MessageID != 0 {
+			result.ProviderMessageID = strconv.FormatInt(response.Result.MessageID, 10)
+		}
+		return result
+	}
+	result.ProviderCode = strconv.Itoa(response.ErrorCode)
+	result.RetryAfter = largerDelay(
+		parseRetryAfter(exchange.header.Get("Retry-After"), time.Now()),
+		secondsDuration(response.Parameters.RetryAfter),
+	)
+	if response.ErrorCode == http.StatusTooManyRequests || response.ErrorCode >= 500 {
+		result.Outcome = delivery.RetryableNotSent
+		result.ErrorType = "provider_transient"
+	} else {
+		result.Outcome = delivery.PermanentRejected
+		result.ErrorType = "provider_rejected"
+	}
+	return result
 }

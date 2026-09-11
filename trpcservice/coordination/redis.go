@@ -9,10 +9,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cyl6/trpc-agent-service/trpcservice/observability"
 	"github.com/redis/go-redis/v9"
 )
 
 const completedValue = "completed"
+
+var sharedRateLimitScript = redis.NewScript(`
+local server_time = redis.call("TIME")
+local seconds = tonumber(server_time[1])
+local window = math.floor(seconds / 60)
+local key = KEYS[1] .. ":" .. window
+local count = redis.call("INCR", key)
+if count == 1 then
+  redis.call("EXPIRE", key, 61)
+end
+local ttl = redis.call("TTL", key)
+return {count, ttl}
+`)
+
+type tenantFreezeValue struct {
+	MigrationID string    `json:"migration_id"`
+	FrozenAt    time.Time `json:"frozen_at"`
+}
 
 var compareDelete = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -31,6 +50,9 @@ return 0
 var compareComplete = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[3])
+  if redis.call("EXISTS", KEYS[2]) == 1 then
+    redis.call("PEXPIRE", KEYS[2], ARGV[3])
+  end
   return 1
 end
 return 0
@@ -49,6 +71,8 @@ type Redis struct {
 	prefix string
 }
 
+var _ RateLimiter = (*Redis)(nil)
+
 func NewRedis(rawURL, prefix string) (*Redis, error) {
 	options, err := redis.ParseURL(rawURL)
 	if err != nil {
@@ -62,6 +86,67 @@ func NewRedis(rawURL, prefix string) (*Redis, error) {
 		return nil, errors.New("coordination redis is unavailable")
 	}
 	return &Redis{client: client, prefix: prefix}, nil
+}
+
+func (r *Redis) Ping(ctx context.Context) error {
+	if r == nil || r.client == nil {
+		return errors.New("coordination redis unavailable")
+	}
+	return r.client.Ping(ctx).Err()
+}
+
+// Allow performs the rate check and increment in one Redis Lua invocation.
+// Redis server time, rather than a worker's local clock, defines the window so
+// two service nodes cannot drift into separate buckets.
+func (r *Redis) Allow(ctx context.Context, tenantID string, limit int) (allowed bool, retryAfter time.Duration, err error) {
+	ctx, finish := observability.StartStorage(ctx, "rate_limit.allow", "redis", tenantID, "")
+	defer func() { finish(err) }()
+	if tenantID == "" {
+		return false, 0, errors.New("coordination: empty rate limiter tenant")
+	}
+	if limit <= 0 {
+		return false, time.Minute, nil
+	}
+	value, err := sharedRateLimitScript.Run(ctx, r.client, []string{r.key("rate", tenantID)}, limit).Result()
+	if err != nil {
+		return false, 0, fmt.Errorf("%w: redis rate check", ErrRateLimiterUnavailable)
+	}
+	values, ok := value.([]interface{})
+	if !ok || len(values) != 2 {
+		return false, 0, fmt.Errorf("%w: invalid redis rate result", ErrRateLimiterUnavailable)
+	}
+	count, ok := redisInt64(values[0])
+	if !ok {
+		return false, 0, fmt.Errorf("%w: invalid redis rate count", ErrRateLimiterUnavailable)
+	}
+	ttl, ok := redisInt64(values[1])
+	if !ok {
+		return false, 0, fmt.Errorf("%w: invalid redis rate ttl", ErrRateLimiterUnavailable)
+	}
+	if count > int64(limit) {
+		if ttl < 1 {
+			ttl = 60
+		}
+		return false, time.Duration(ttl) * time.Second, nil
+	}
+	return true, 0, nil
+}
+
+func redisInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	case string:
+		var parsed int64
+		if _, err := fmt.Sscan(typed, &parsed); err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func (r *Redis) Claim(ctx context.Context, key string, ttl time.Duration) (ClaimLease, error) {
@@ -89,7 +174,7 @@ func (r *Redis) Complete(ctx context.Context, key, ownerToken string, ttl time.D
 	result, err := compareComplete.Run(
 		ctx,
 		r.client,
-		[]string{r.key("dedup", key)},
+		[]string{r.key("dedup", key), r.key("result", key)},
 		"processing:"+ownerToken,
 		completedValue,
 		ttl.Milliseconds(),
@@ -150,6 +235,79 @@ func (r *Redis) LoadResult(ctx context.Context, key string, value any) (bool, er
 func (r *Redis) DeleteResult(ctx context.Context, key string) error {
 	if err := r.client.Del(ctx, r.key("result", key)).Err(); err != nil {
 		return fmt.Errorf("delete pending result: %w", err)
+	}
+	return nil
+}
+
+// FreezeTenant installs a persistent distributed write fence. A different
+// migration cannot steal it; retrying the same migration is idempotent.
+func (r *Redis) FreezeTenant(ctx context.Context, tenantID, appName, migrationID string) (time.Time, error) {
+	if tenantID == "" || appName == "" || migrationID == "" {
+		return time.Time{}, errors.New("coordination: tenant freeze identity is required")
+	}
+	key := r.tenantFreezeKey(tenantID, appName)
+	currentID, frozenAt, frozen, err := r.TenantFreeze(ctx, tenantID, appName)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if frozen {
+		if currentID != migrationID {
+			return time.Time{}, errors.New("coordination: tenant is frozen by another migration")
+		}
+		return frozenAt, nil
+	}
+	value := tenantFreezeValue{MigrationID: migrationID, FrozenAt: time.Now().UTC()}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return time.Time{}, errors.New("coordination: encode tenant freeze")
+	}
+	ok, err := r.client.SetNX(ctx, key, encoded, 0).Result()
+	if err != nil {
+		return time.Time{}, errors.New("coordination: install tenant freeze")
+	}
+	if !ok {
+		currentID, frozenAt, frozen, err = r.TenantFreeze(ctx, tenantID, appName)
+		if err != nil || !frozen || currentID != migrationID {
+			return time.Time{}, errors.New("coordination: tenant freeze raced with another migration")
+		}
+		return frozenAt, nil
+	}
+	return value.FrozenAt, nil
+}
+
+func (r *Redis) TenantFreeze(ctx context.Context, tenantID, appName string) (string, time.Time, bool, error) {
+	if tenantID == "" || appName == "" {
+		return "", time.Time{}, false, errors.New("coordination: tenant freeze identity is required")
+	}
+	encoded, err := r.client.Get(ctx, r.tenantFreezeKey(tenantID, appName)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, errors.New("coordination: read tenant freeze")
+	}
+	var value tenantFreezeValue
+	if err := json.Unmarshal(encoded, &value); err != nil || value.MigrationID == "" || value.FrozenAt.IsZero() {
+		return "", time.Time{}, false, errors.New("coordination: corrupt tenant freeze")
+	}
+	return value.MigrationID, value.FrozenAt, true, nil
+}
+
+// UnfreezeTenant removes only the calling migration's fence.
+func (r *Redis) UnfreezeTenant(ctx context.Context, tenantID, appName, migrationID string) error {
+	currentID, _, frozen, err := r.TenantFreeze(ctx, tenantID, appName)
+	if err != nil || !frozen {
+		return err
+	}
+	if currentID != migrationID {
+		return errors.New("coordination: tenant freeze ownership lost")
+	}
+	encoded, err := r.client.Get(ctx, r.tenantFreezeKey(tenantID, appName)).Result()
+	if err != nil {
+		return errors.New("coordination: read tenant freeze for release")
+	}
+	if _, err := compareDelete.Run(ctx, r.client, []string{r.tenantFreezeKey(tenantID, appName)}, encoded).Result(); err != nil {
+		return errors.New("coordination: release tenant freeze")
 	}
 	return nil
 }
@@ -223,6 +381,10 @@ func (r *Redis) Lock(ctx context.Context, key string, ttl time.Duration) (*LockL
 
 func (r *Redis) key(kind, key string) string {
 	return r.prefix + ":" + kind + ":" + key
+}
+
+func (r *Redis) tenantFreezeKey(tenantID, appName string) string {
+	return r.key("tenant-freeze", tenantID+":"+appName)
 }
 
 func (r *Redis) Close() error { return r.client.Close() }

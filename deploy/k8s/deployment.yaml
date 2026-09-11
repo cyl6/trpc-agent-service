@@ -7,17 +7,14 @@ metadata:
     app.kubernetes.io/name: trpc-agent-service
     app.kubernetes.io/component: gateway-worker
 spec:
-  # Single replica is intentional. Inbox dispatch, tool approvals, budget
-  # counters and config control are process-local in this runnable demo.
-  # Add a durable queue and shared approval/budget/config stores before
-  # increasing replicas; Session and Memory are already Redis-backed.
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 5
   minReadySeconds: 10
   strategy:
-    # Recreate avoids a brief two-Pod overlap while governance state remains
-    # process-local. Accept the demo downtime until those stores are shared.
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: trpc-agent-service
@@ -54,16 +51,27 @@ spec:
               valueFrom:
                 resourceFieldRef:
                   resource: limits.cpu
-            - name: ADMIN_TOKEN
+            - name: TRPC_CONFIG_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TRPC_SECRET_ROOT
+              value: /mnt/secrets-store
+            - name: DASHSCOPE_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
-                  key: admin-token
+                  key: dashscope-api-key
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
                   key: redis-url
+            - name: TRPC_AGENT_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: runtime-postgres-dsn
             - name: ACME_TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -84,6 +92,16 @@ spec:
                 secretKeyRef:
                   name: trpc-agent-service-secrets
                   key: acme-slack-signing-secret
+            - name: ACME_WECOM_AIBOT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-wecom-aibot-id
+            - name: ACME_WECOM_AIBOT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trpc-agent-service-secrets
+                  key: acme-wecom-aibot-secret
             - name: GLOBEX_TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -104,6 +122,11 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            - name: audit-spool
+              mountPath: /tmp/audit-spool
           startupProbe:
             httpGet:
               path: /healthz
@@ -128,7 +151,7 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["/bin/sh", "-c", "sleep 5"]
+                command: ["/bin/sh", "-c", "wget -q -O- --post-data='' http://127.0.0.1:8080/-/drain || true; sleep 10"]
           resources:
             requests:
               cpu: 250m
@@ -151,6 +174,15 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: trpc-agent-service-runtime-secrets
+        - name: audit-spool
+          persistentVolumeClaim:
+            claimName: trpc-agent-audit-spool
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

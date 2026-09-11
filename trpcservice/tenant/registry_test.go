@@ -71,6 +71,23 @@ func TestApplyRejectsChangedConfigAtSameVersion(t *testing.T) {
 	}
 }
 
+func TestResolveBindingForTenantFencesOutboxOwner(t *testing.T) {
+	registry, err := NewRegistry(&config.Config{
+		Coordination: config.CoordinationConfig{Backend: "inmemory"},
+		Tenants:      []config.TenantConfig{tenantConfig("tenant-b", "v1", "reassigned-binding")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.ResolveBindingForTenant("tenant-a", "telegram", "reassigned-binding"); !errors.Is(err, ErrBindingTenantMismatch) {
+		t.Fatalf("cross-tenant resolve = %v, want ErrBindingTenantMismatch", err)
+	}
+	binding, err := registry.ResolveBindingForTenant("tenant-b", "telegram", "reassigned-binding")
+	if err != nil || binding.Tenant.TenantID != "tenant-b" {
+		t.Fatalf("owner resolve = %+v, %v", binding, err)
+	}
+}
+
 func TestApplyRejectsChangedPreviouslySeenVersion(t *testing.T) {
 	v1 := tenantConfig("tenant-a", "v1", "binding-a")
 	registry, err := NewRegistry(&config.Config{

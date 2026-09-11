@@ -33,6 +33,17 @@ func (m *Metrics) Add(name, help string, value float64, labels map[string]string
 	m.mu.Unlock()
 }
 
+// Set records the current value of a gauge, replacing the previous sample for
+// the same bounded label set.
+func (m *Metrics) Set(name, help string, value float64, labels map[string]string) {
+	key := metricKey(name, labels)
+	m.mu.Lock()
+	m.values[key] = value
+	m.help[name] = help
+	m.types[name] = "gauge"
+	m.mu.Unlock()
+}
+
 func (m *Metrics) Observe(name, help string, value float64, labels map[string]string) {
 	m.Add(name+"_sum", help, value, labels)
 	m.Add(name+"_count", help, 1, labels)

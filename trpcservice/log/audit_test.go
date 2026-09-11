@@ -44,3 +44,28 @@ func TestRouterUsesImmutableEntryPolicyAndCurrentReferencedSecret(t *testing.T) 
 		t.Fatalf("snapshot-routed audit did not redact the current secret: %q", out.String())
 	}
 }
+
+func TestRouterRefreshesRotatedAndRuntimeSecretsForCachedSink(t *testing.T) {
+	const envName = "AUDIT_DYNAMIC_SECRET"
+	var out bytes.Buffer
+	router := NewRouter(nil, &out, nil)
+	policy := config.AuditPolicy{Enabled: true, Sink: "stdout"}
+	write := func(secret string) {
+		t.Helper()
+		config.RegisterSecret(envName, secret)
+		if err := router.Write(Entry{
+			TenantID: "tenant-a", ConfigRevision: "v1", Decision: "deny",
+			Reason: secret, PolicySnapshot: &policy, SecretEnvNames: []string{envName},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer config.RegisterSecret(envName, "")
+	write("first-runtime-secret")
+	write("rotated-runtime-secret")
+	for _, forbidden := range []string{"first-runtime-secret", "rotated-runtime-secret"} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("cached audit sink leaked %q: %s", forbidden, out.String())
+		}
+	}
+}

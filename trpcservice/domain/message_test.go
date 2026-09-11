@@ -39,6 +39,28 @@ func TestIdentityIsolationAndConversationRules(t *testing.T) {
 	}
 }
 
+func TestAPIIdentityHonorsExplicitDirectConversation(t *testing.T) {
+	message := InboundMessage{
+		TenantID: "tenant-a", BindingID: "admin-api", Channel: "api",
+		ExternalUserID: "u1", ConversationID: "conversation-1", Scope: ScopeDirect,
+	}
+	userA, sessionA := Identity(message, "assistant")
+	message.ConversationID = "conversation-2"
+	userB, sessionB := Identity(message, "assistant")
+	if userA != userB {
+		t.Fatal("one simulated user should retain one user identity across API conversations")
+	}
+	if sessionA == sessionB {
+		t.Fatal("separate API conversations must not share a model session")
+	}
+
+	message.ExternalUserID = "u2"
+	_, otherUserSession := Identity(message, "assistant")
+	if otherUserSession == sessionB {
+		t.Fatal("different simulated users must not collide on a chosen conversation id")
+	}
+}
+
 func TestAppNamespaceIsStableAndOpaque(t *testing.T) {
 	a := AppNamespace("tenant-a", "assistant")
 	b := AppNamespace("tenant-b", "assistant")

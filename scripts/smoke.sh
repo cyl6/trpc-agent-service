@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 solution_root="$(cd "${script_dir}/.." && pwd)"
-smoke_port="${SMOKE_PORT:-18080}"
+smoke_port="${SMOKE_PORT:-}"
 smoke_admin_token="smoke-placeholder-admin-token"
 tmp_dir="$(mktemp -d -t trpc-service-smoke-XXXXXX)"
 service_pid=""
@@ -22,6 +22,35 @@ require_command() {
     echo "required command not found: $1" >&2
     exit 1
   fi
+}
+
+port_in_use() {
+  local port="$1"
+  (exec 3<>"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1
+}
+
+choose_smoke_port() {
+  local attempt candidate
+  if [[ -n "${smoke_port}" ]]; then
+    if [[ ! "${smoke_port}" =~ ^[0-9]+$ ]] || ((smoke_port < 1 || smoke_port > 65535)); then
+      echo "SMOKE_PORT must be an integer between 1 and 65535" >&2
+      exit 1
+    fi
+    if port_in_use "${smoke_port}"; then
+      echo "SMOKE_PORT ${smoke_port} is already in use" >&2
+      exit 1
+    fi
+    return
+  fi
+  for ((attempt = 1; attempt <= 40; attempt++)); do
+    candidate=$((20000 + (RANDOM << 1 ^ RANDOM) % 30000))
+    if ! port_in_use "${candidate}"; then
+      smoke_port="${candidate}"
+      return
+    fi
+  done
+  echo "could not find an unused local port for the smoke service" >&2
+  exit 1
 }
 
 wait_for_http() {
@@ -46,6 +75,18 @@ wait_for_http() {
 
 require_command go
 require_command curl
+require_command npm
+choose_smoke_port
+echo "==> using local smoke port ${smoke_port}"
+
+echo "==> frontend build"
+(
+  cd "${solution_root}/im-console"
+  if [[ ! -d node_modules ]]; then
+    npm ci --no-audit --no-fund
+  fi
+  npm run build:embed
+)
 
 echo "==> unit tests"
 (
@@ -58,6 +99,11 @@ echo "==> static analysis"
   cd "${solution_root}"
   go vet ./...
   CGO_ENABLED=0 go build -trimpath -o "${tmp_dir}/trpc-service" ./cmd/trpc-service
+  CGO_ENABLED=0 go build -trimpath -o "${tmp_dir}/trpc-migrate" ./cmd/trpc-migrate
+  CGO_ENABLED=0 go build -trimpath -o "${tmp_dir}/trpc-data-migrate" ./cmd/trpc-data-migrate
+  "${tmp_dir}/trpc-service" -h >/dev/null 2>&1
+  "${tmp_dir}/trpc-migrate" -h >/dev/null 2>&1
+  "${tmp_dir}/trpc-data-migrate" -h >/dev/null 2>&1
 )
 
 echo "==> deployment syntax"
@@ -86,7 +132,28 @@ echo "==> local HTTP smoke test"
 sed \
   "s/address: \":8080\"/address: \"127.0.0.1:${smoke_port}\"/" \
   "${solution_root}/config/example.yaml" \
-  >"${tmp_dir}/config.yaml"
+  >"${tmp_dir}/config.with-primary.yaml"
+# Keep smoke tests deterministic and offline: replace only the first tenant's
+# model block and disable external long connections. Placeholder credentials
+# must never cause the offline smoke test to dial a real IM platform.
+awk '
+  !done && $0 == "    model:" {
+    in_model = 1
+    print
+    print "      provider: mock"
+    print "      name: deterministic-mock"
+    next
+  }
+  in_model && $0 == "    tools:" {
+    in_model = 0
+    done = 1
+    print
+    next
+  }
+  /^      - type:/ { in_aibot = ($0 == "      - type: wecom-aibot") }
+  in_aibot && /^        enabled:/ { print "        enabled: false"; next }
+  !in_model { print }
+' "${tmp_dir}/config.with-primary.yaml" >"${tmp_dir}/config.yaml"
 
 ADMIN_TOKEN="${smoke_admin_token}" \
   "${tmp_dir}/trpc-service" -config "${tmp_dir}/config.yaml" \

@@ -373,6 +373,10 @@ CREATE TABLE knowledge_chunks (
 CREATE TABLE outbox_messages (
     tenant_id text NOT NULL,
     outbox_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    operation_key text NOT NULL,
+    operation_version smallint NOT NULL DEFAULT 1 CHECK (operation_version > 0),
+    part_index integer NOT NULL DEFAULT 0 CHECK (part_index >= 0),
+    part_count integer NOT NULL DEFAULT 1 CHECK (part_count > 0 AND part_index < part_count),
     channel_type text NOT NULL,
     binding_id text NOT NULL,
     session_id text NOT NULL,
@@ -384,13 +388,24 @@ CREATE TABLE outbox_messages (
     payload_ciphertext bytea,
     payload_metadata jsonb NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(payload_metadata) = 'object'),
+    payload_sha256 text NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
     status text NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'sending', 'sent', 'retry', 'dead_letter', 'cancelled')),
+    delivery_state text NOT NULL DEFAULT 'pending'
+        CHECK (delivery_state IN (
+            'pending', 'in_flight', 'confirmed', 'retryable_not_sent',
+            'permanent_rejected', 'unknown', 'retry_exhausted', 'canceled'
+        )),
+    state_version bigint NOT NULL DEFAULT 0 CHECK (state_version >= 0),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     lease_owner text NOT NULL DEFAULT '',
     lease_expires_at timestamptz,
     next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    provider_code text NOT NULL DEFAULT '',
     provider_message_id text NOT NULL DEFAULT '',
+    provider_request_id text NOT NULL DEFAULT '',
+    response_sha256 text NOT NULL DEFAULT ''
+        CHECK (response_sha256 = '' OR response_sha256 ~ '^[0-9a-f]{64}$'),
     last_error_type text NOT NULL DEFAULT '',
     trace_id text NOT NULL DEFAULT '',
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -398,12 +413,55 @@ CREATE TABLE outbox_messages (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (tenant_id, outbox_id),
     UNIQUE (tenant_id, dedup_key),
+    UNIQUE (tenant_id, operation_key),
     FOREIGN KEY (tenant_id, channel_type, binding_id)
         REFERENCES channel_bindings (tenant_id, channel_type, binding_id),
     FOREIGN KEY (tenant_id, session_id)
         REFERENCES sessions (tenant_id, session_id) ON DELETE CASCADE,
     FOREIGN KEY (tenant_id, event_id)
         REFERENCES session_events (tenant_id, event_id)
+);
+
+CREATE TABLE outbox_delivery_attempts (
+    tenant_id text NOT NULL,
+    outbox_id uuid NOT NULL,
+    attempt_no integer NOT NULL CHECK (attempt_no > 0),
+    operation_key text NOT NULL,
+    lease_owner text NOT NULL,
+    phase text NOT NULL CHECK (phase IN ('leased', 'dispatched', 'finished')),
+    outcome text NOT NULL DEFAULT ''
+        CHECK (outcome IN ('', 'confirmed', 'retryable_not_sent', 'permanent_rejected', 'unknown')),
+    error_type text NOT NULL DEFAULT '',
+    provider_code text NOT NULL DEFAULT '',
+    http_status integer NOT NULL DEFAULT 0 CHECK (http_status BETWEEN 0 AND 999),
+    provider_message_id text NOT NULL DEFAULT '',
+    provider_request_id text NOT NULL DEFAULT '',
+    response_sha256 text NOT NULL DEFAULT ''
+        CHECK (response_sha256 = '' OR response_sha256 ~ '^[0-9a-f]{64}$'),
+    started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    dispatched_at timestamptz,
+    finished_at timestamptz,
+    PRIMARY KEY (tenant_id, outbox_id, attempt_no),
+    FOREIGN KEY (tenant_id, outbox_id)
+        REFERENCES outbox_messages (tenant_id, outbox_id) ON DELETE CASCADE
+);
+
+CREATE TABLE outbox_delivery_resolutions (
+    tenant_id text NOT NULL,
+    resolution_id uuid NOT NULL,
+    outbox_id uuid NOT NULL,
+    expected_version bigint NOT NULL CHECK (expected_version >= 0),
+    expected_attempt integer NOT NULL CHECK (expected_attempt > 0),
+    action text NOT NULL CHECK (action IN ('assume_delivered', 'retry', 'cancel')),
+    actor_hash text NOT NULL,
+    reason_redacted text NOT NULL,
+    resulting_status text NOT NULL,
+    resulting_delivery_state text NOT NULL,
+    resulting_version bigint NOT NULL CHECK (resulting_version > expected_version),
+    resolved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, resolution_id),
+    FOREIGN KEY (tenant_id, outbox_id)
+        REFERENCES outbox_messages (tenant_id, outbox_id) ON DELETE CASCADE
 );
 
 CREATE TABLE tool_approvals (
@@ -544,6 +602,14 @@ CREATE INDEX outbox_dispatch_idx
     WHERE status IN ('pending', 'retry');
 CREATE INDEX outbox_lease_idx
     ON outbox_messages (lease_expires_at) WHERE status = 'sending';
+CREATE INDEX outbox_unknown_idx
+    ON outbox_messages (tenant_id, updated_at, outbox_id)
+    WHERE status = 'sending' AND delivery_state = 'unknown';
+CREATE INDEX outbox_attempt_phase_idx
+    ON outbox_delivery_attempts (tenant_id, phase, started_at)
+    WHERE phase <> 'finished';
+CREATE INDEX outbox_resolution_time_idx
+    ON outbox_delivery_resolutions (tenant_id, outbox_id, resolved_at DESC);
 CREATE INDEX approvals_pending_idx
     ON tool_approvals (tenant_id, session_id, expires_at)
     WHERE status = 'pending';
@@ -604,7 +670,8 @@ BEGIN
         'tool_policies', 'data_backend_bindings', 'channel_bindings',
         'channel_user_mappings', 'sessions', 'inbox_messages', 'session_events',
         'memories', 'session_summaries', 'artifacts', 'knowledge_documents',
-        'knowledge_chunks', 'outbox_messages', 'tool_approvals', 'model_usage',
+        'knowledge_chunks', 'outbox_messages', 'outbox_delivery_attempts',
+        'outbox_delivery_resolutions', 'tool_approvals', 'model_usage',
         'audit_logs', 'migration_checkpoints'
     ]
     LOOP
@@ -637,8 +704,9 @@ GRANT SELECT ON tenants, tenant_config_revisions, agent_apps, model_configs,
     tool_policies, data_backend_bindings, channel_bindings TO tenant_agent_runtime;
 GRANT SELECT, INSERT, UPDATE ON channel_user_mappings, sessions,
     inbox_messages, memories, session_summaries, artifacts, outbox_messages,
-    tool_approvals TO tenant_agent_runtime;
-GRANT SELECT, INSERT ON session_events, model_usage, audit_logs TO tenant_agent_runtime;
+    outbox_delivery_attempts, tool_approvals TO tenant_agent_runtime;
+GRANT SELECT, INSERT ON session_events, outbox_delivery_resolutions,
+    model_usage, audit_logs TO tenant_agent_runtime;
 GRANT SELECT ON knowledge_documents, knowledge_chunks TO tenant_agent_runtime;
 
 -- The migration executor, not the migration itself, records the actual file

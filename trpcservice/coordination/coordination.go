@@ -20,9 +20,10 @@ const (
 )
 
 var (
-	ErrClaimOwnershipLost = errors.New("coordination: claim ownership lost")
-	ErrLockOwnershipLost  = errors.New("coordination: lock ownership lost")
-	ErrClaimInProgress    = errors.New("coordination: message claim is still processing")
+	ErrClaimOwnershipLost     = errors.New("coordination: claim ownership lost")
+	ErrLockOwnershipLost      = errors.New("coordination: lock ownership lost")
+	ErrClaimInProgress        = errors.New("coordination: message claim is still processing")
+	ErrRateLimiterUnavailable = errors.New("coordination: shared rate limiter unavailable")
 )
 
 // ClaimLease identifies the worker that owns a processing claim. The token is
@@ -52,6 +53,21 @@ type Coordinator interface {
 	Close() error
 }
 
+// RateLimiter is the shared tenant request limiter. Implementations must make
+// the increment and limit check one atomic operation. A false result means the
+// tenant has reached its configured fixed-window limit; retryAfter is a best
+// effort delay until the next window.
+type RateLimiter interface {
+	Allow(ctx context.Context, tenantID string, limit int) (allowed bool, retryAfter time.Duration, err error)
+}
+
+// TenantFreezeReader is an optional distributed maintenance fence. Workers
+// that receive a coordinator implementing it reject new tenant work while a
+// backend migration drains already-running turns.
+type TenantFreezeReader interface {
+	TenantFreeze(ctx context.Context, tenantID, appName string) (migrationID string, frozenAt time.Time, frozen bool, err error)
+}
+
 type claim struct {
 	state   ClaimState
 	owner   string
@@ -64,10 +80,12 @@ type lockEntry struct {
 }
 
 type InMemory struct {
-	mu      sync.Mutex
-	claims  map[string]claim
-	results map[string]storedResult
-	locks   map[string]*lockEntry
+	mu        sync.Mutex
+	claims    map[string]claim
+	results   map[string]storedResult
+	locks     map[string]*lockEntry
+	rate      map[string]rateBucket
+	nextSweep time.Time
 }
 
 type storedResult struct {
@@ -75,8 +93,50 @@ type storedResult struct {
 	expires time.Time
 }
 
+type rateBucket struct {
+	window int64
+	count  int
+}
+
 func NewInMemory() *InMemory {
-	return &InMemory{claims: make(map[string]claim), results: make(map[string]storedResult), locks: make(map[string]*lockEntry)}
+	return &InMemory{
+		claims: make(map[string]claim), results: make(map[string]storedResult),
+		locks: make(map[string]*lockEntry), rate: make(map[string]rateBucket),
+	}
+}
+
+func (m *InMemory) Ping(context.Context) error { return nil }
+
+// Allow implements the same fixed UTC-minute semantics as the Redis limiter.
+// It exists for unit tests and explicitly non-production in-memory runs.
+func (m *InMemory) Allow(_ context.Context, tenantID string, limit int) (bool, time.Duration, error) {
+	if tenantID == "" {
+		return false, 0, errors.New("coordination: empty rate limiter tenant")
+	}
+	now := time.Now()
+	window := now.Unix() / 60
+	m.mu.Lock()
+	bucket := m.rate[tenantID]
+	if bucket.window != window {
+		bucket = rateBucket{window: window}
+	}
+	if limit <= 0 || bucket.count >= limit {
+		m.rate[tenantID] = bucket
+		m.mu.Unlock()
+		return false, nextMinute(now), nil
+	}
+	bucket.count++
+	m.rate[tenantID] = bucket
+	m.mu.Unlock()
+	return true, 0, nil
+}
+
+func nextMinute(now time.Time) time.Duration {
+	retryAfter := now.Truncate(time.Minute).Add(time.Minute).Sub(now)
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	return retryAfter
 }
 
 func (m *InMemory) Claim(_ context.Context, key string, ttl time.Duration) (ClaimLease, error) {
@@ -86,6 +146,7 @@ func (m *InMemory) Claim(_ context.Context, key string, ttl time.Duration) (Clai
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
+	m.sweepExpired(now)
 	if existing, ok := m.claims[key]; ok && now.Before(existing.expires) {
 		return ClaimLease{State: existing.state}, nil
 	}
@@ -94,14 +155,37 @@ func (m *InMemory) Claim(_ context.Context, key string, ttl time.Duration) (Clai
 	return ClaimLease{State: Claimed, Token: owner}, nil
 }
 
+func (m *InMemory) sweepExpired(now time.Time) {
+	if !m.nextSweep.IsZero() && now.Before(m.nextSweep) {
+		return
+	}
+	for key, item := range m.claims {
+		if !now.Before(item.expires) {
+			delete(m.claims, key)
+		}
+	}
+	for key, item := range m.results {
+		if !now.Before(item.expires) {
+			delete(m.results, key)
+		}
+	}
+	m.nextSweep = now.Add(time.Minute)
+}
+
 func (m *InMemory) Complete(_ context.Context, key, ownerToken string, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	existing, ok := m.claims[key]
-	if !ok || existing.state != AlreadyProcessing || existing.owner != ownerToken || time.Now().After(existing.expires) {
+	now := time.Now()
+	if !ok || existing.state != AlreadyProcessing || existing.owner != ownerToken || now.After(existing.expires) {
 		return ErrClaimOwnershipLost
 	}
-	m.claims[key] = claim{state: AlreadyCompleted, expires: time.Now().Add(ttl)}
+	expires := now.Add(ttl)
+	m.claims[key] = claim{state: AlreadyCompleted, expires: expires}
+	if result, ok := m.results[key]; ok {
+		result.expires = expires
+		m.results[key] = result
+	}
 	return nil
 }
 
